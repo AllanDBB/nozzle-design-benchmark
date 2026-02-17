@@ -1,0 +1,59 @@
+{
+  "out_dir": "out/test_rans_2d_heavy",
+  "moc": {
+    "mach_exit": 2.8,
+    "pressure_ratio": 0.08,
+    "geometry": {
+      "throat_y": 0.02,
+      "exit_y": 0.068,
+      "length": 0.26,
+      "n_points": 220,
+      "throat_angle_deg": 4.5,
+      "ramp_power": 0.65
+    }
+  },
+  "evaluator": {
+    "backend": "openfoam",
+    "dimension": "2d_planar",
+    "fallback_on_failure": true,
+    "depth": 0.02,
+    "mesh_nx": 240,
+    "mesh_ny": 110,
+    "end_time": 2200,
+    "write_interval": 300,
+    "gamma": 1.4,
+    "stagnation_temperature": 1050.0,
+    "stagnation_pressure": 650000.0,
+    "ambient_pressure": 80000.0,
+    "inlet_velocity": 15.0,
+    "k_inlet": 1.2,
+    "epsilon_inlet": 20.0,
+    "p_initial": 560000.0,
+    "u_initial": 3.0,
+    "t_initial": 1020.0,
+    "n_samples": 120
+  },
+  "optimization": {
+    "algorithm": "ga",
+    "seed": 42,
+    "bounds": {
+      "exit_radius": [
+        0.058,
+        0.078
+      ],
+      "length": [
+        0.22,
+        0.34
+      ],
+      "shape": [
+        1.3,
+        2.4
+      ]
+    },
+    "population": 18,
+    "generations": 8,
+    "sigma": 0.08,
+    "n_points": 220,
+    "profile": "bezier_like"
+  }
+}

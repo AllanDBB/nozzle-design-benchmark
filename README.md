@@ -19,6 +19,7 @@ Salida principal:
 - Comparación MOC vs optimizada
 - Geometrías y reportes guardados en `out/...`
 - Graficas comparativas automáticas (incluye velocidad a lo largo del eje)
+- Gráfica de líneas características MOC (`moc_characteristics.png`)
 
 ## 2) Lo minimo que necesitas
 - Docker Desktop instalado y abierto
@@ -45,6 +46,16 @@ docker compose run --rm nozzle python3 main_pipeline.py --config docs/rans_3d_qu
 
 Estos son los perfiles recomendados para verificar flujo completo de trabajo.
 
+### Caso 2D pesado (más fidelidad, más tiempo)
+```bash
+docker compose run --rm nozzle python3 main_pipeline.py --config docs/rans_2d_heavy.json
+```
+
+### Caso 3D pesado (más fidelidad, más tiempo)
+```bash
+docker compose run --rm nozzle python3 main_pipeline.py --config docs/rans_3d_heavy.json
+```
+
 ## 5) Donde quedan los resultados
 ### 2D
 - `out/test_rans_2d/summary.json`
@@ -52,6 +63,7 @@ Estos son los perfiles recomendados para verificar flujo completo de trabajo.
 - `out/test_rans_2d/report.md`
 - `out/test_rans_2d/moc_geometry.csv`
 - `out/test_rans_2d/optimized_geometry.csv`
+- `out/test_rans_2d/moc_characteristics.png`
 - `out/test_rans_2d/compare_velocity.png`
 - `out/test_rans_2d/compare_mach.png`
 - `out/test_rans_2d/compare_pressure.png`
@@ -65,6 +77,7 @@ Estos son los perfiles recomendados para verificar flujo completo de trabajo.
 - `out/test_rans_3d/report.md`
 - `out/test_rans_3d/moc_geometry.csv`
 - `out/test_rans_3d/optimized_geometry.csv`
+- `out/test_rans_3d/moc_characteristics.png`
 - `out/test_rans_3d/compare_velocity.png`
 - `out/test_rans_3d/compare_mach.png`
 - `out/test_rans_3d/compare_pressure.png`
@@ -125,6 +138,17 @@ Por eso se recomienda:
 1. empezar con `quick`
 2. luego estrechar rangos de diseño
 3. después probar modo estricto
+
+### Por que a veces "OPT" sale peor que MOC
+Las causas mas comunes son:
+- presupuesto de optimización bajo (`n_samples`, `population`, `generations`)
+- espacio de búsqueda demasiado amplio o mal centrado
+- casos CFD no convergidos (si hay fallback, la señal de optimización es menos fiel)
+
+Si pasa eso, usa perfiles `heavy` y/o sube:
+- malla (`mesh_nx`, `mesh_ny`, `mesh_nz`)
+- evaluaciones de optimización (`population`, `generations`)
+- tiempo de solver (`end_time`)
 
 ## 9) Modo estricto RANS (solo si quieres forzar todo CFD)
 Archivos:

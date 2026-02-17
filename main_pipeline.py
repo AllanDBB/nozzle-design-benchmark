@@ -101,6 +101,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
 
     moc_geometry.exportGeo(str(out_dir / "moc_geometry.csv"))
     moc_geometry.plotProfile(str(out_dir / "moc_geometry.png"))
+    moc_solver.plotCharacteristics(moc_geometry, str(out_dir / "moc_characteristics.png"))
 
     # 2) Optimize parametrized geometry using CFD-like evaluator.
     eval_cfg = dict(config["evaluator"])
