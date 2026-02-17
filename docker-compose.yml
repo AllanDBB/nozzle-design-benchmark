@@ -1,0 +1,10 @@
+services:
+  nozzle:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nozzle-design-benchmark:latest
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    command: python3 main_pipeline.py

@@ -7,7 +7,7 @@ from typing import Dict, Any
 
 from analysis import AnalysisNote
 from benchmarks import BenchmarkSuite
-from evaluators import CFDSimulation
+from evaluators import CFDSimulation, OpenFOAMRANSEvaluator
 from geometry import MOCSolver, NozzleGeometry
 from optimization import Optimizer, OptimizationRunner
 
@@ -27,11 +27,13 @@ def default_config() -> Dict[str, Any]:
             },
         },
         "evaluator": {
+            "backend": "openfoam",
             "gamma": 1.4,
             "stagnation_temperature": 1000.0,
-            "stagnation_pressure": 1.5e6,
-            "ambient_pressure": 1.0e4,
+            "stagnation_pressure": 6.0e5,
+            "ambient_pressure": 8.0e4,
             "n_samples": 90,
+            "fallback_on_failure": False,
             "friction_scale": 0.2,
             "cf_multiplier": 1.0,
             "curvature_scale": 0.05,
@@ -40,17 +42,29 @@ def default_config() -> Dict[str, Any]:
             "enable_shock_model": True,
             "shock_trigger_ratio": 0.55,
             "divergence_scale": 1.0,
+            "dimension": "2d_planar",
+            "depth": 0.02,
+            "mesh_nx": 180,
+            "mesh_ny": 80,
+            "mesh_nz": 12,
+            "end_time": 1500,
+            "write_interval": 300,
+            "inlet_velocity": 20.0,
+            "k_inlet": 1.0,
+            "epsilon_inlet": 50.0,
+            "p_initial": 5.4e5,
+            "u_initial": 1.0,
+            "t_initial": 1000.0,
         },
         "optimization": {
-            "algorithm": "ga",
+            "algorithm": "random",
             "seed": 42,
             "bounds": {
-                "exit_radius": [0.050, 0.085],
-                "length": [0.16, 0.35],
-                "shape": [1.1, 2.4],
+                "exit_radius": [0.055, 0.075],
+                "length": [0.20, 0.32],
+                "shape": [1.4, 2.2],
             },
-            "population": 18,
-            "generations": 10,
+            "n_samples": 3,
             "n_points": 180,
             "profile": "bezier_like",
         },
@@ -92,7 +106,13 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     eval_cfg = dict(config["evaluator"])
     opt_cfg = config["optimization"]
 
-    evaluator = CFDSimulation(geometry=moc_geometry, solverConfig=eval_cfg, resultPath=str(out_dir))
+    def make_evaluator(geometry: NozzleGeometry):
+        backend = str(eval_cfg.get("backend", "quasi1d")).lower()
+        if backend == "openfoam":
+            return OpenFOAMRANSEvaluator(geometry=geometry, solverConfig=eval_cfg, resultPath=str(out_dir))
+        return CFDSimulation(geometry=geometry, solverConfig=eval_cfg, resultPath=str(out_dir))
+
+    evaluator = make_evaluator(moc_geometry)
     throat = float(moc_cfg["geometry"]["throat_y"])
     n_points = int(opt_cfg.get("n_points", 180))
     profile = str(opt_cfg.get("profile", "bezier_like"))
@@ -125,7 +145,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     optimized_geometry.plotProfile(str(out_dir / "optimized_geometry.png"))
 
     # 3) Benchmark MOC vs optimized with same evaluator.
-    bench_eval = CFDSimulation(geometry=moc_geometry, solverConfig=eval_cfg, resultPath=str(out_dir))
+    bench_eval = make_evaluator(moc_geometry)
     suite = BenchmarkSuite(mocGeometry=moc_geometry, optimizedGeometry=optimized_geometry, evaluator=bench_eval)
     suite.runAll()
     comparison = suite.save(str(out_dir))

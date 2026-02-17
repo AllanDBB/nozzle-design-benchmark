@@ -1,0 +1,46 @@
+{
+  "out_dir": "out/pipeline_rans_3d",
+  "moc": {
+    "mach_exit": 2.5,
+    "pressure_ratio": 0.08,
+    "geometry": {
+      "throat_y": 0.02,
+      "exit_y": 0.065,
+      "length": 0.24,
+      "n_points": 180
+    }
+  },
+  "evaluator": {
+    "backend": "openfoam",
+    "dimension": "3d_channel",
+    "depth": 0.02,
+    "mesh_nx": 90,
+    "mesh_ny": 40,
+    "mesh_nz": 8,
+    "end_time": 1500,
+    "write_interval": 300,
+    "fallback_on_failure": false,
+    "gamma": 1.4,
+    "stagnation_temperature": 1000.0,
+    "stagnation_pressure": 600000.0,
+    "ambient_pressure": 80000.0,
+    "inlet_velocity": 20.0,
+    "k_inlet": 1.0,
+    "epsilon_inlet": 50.0,
+    "p_initial": 540000.0,
+    "u_initial": 1.0,
+    "t_initial": 1000.0
+  },
+  "optimization": {
+    "algorithm": "random",
+    "seed": 42,
+    "bounds": {
+      "exit_radius": [0.055, 0.075],
+      "length": [0.20, 0.32],
+      "shape": [1.4, 2.2]
+    },
+    "n_samples": 2,
+    "n_points": 180,
+    "profile": "bezier_like"
+  }
+}

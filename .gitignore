@@ -205,3 +205,27 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project-generated artifacts
+out/
+tmp/
+temp/
+*.tmp
+
+# OpenFOAM generated files/cases
+processor*/
+postProcessing/
+dynamicCode/
+constant/polyMesh/
+*.OpenFOAM
+*.foam
+log.*
+*.log
+*.dat
+*.vtk
+core
+core.*
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

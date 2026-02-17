@@ -6,7 +6,7 @@ from pathlib import Path
 import json
 
 from geometry import NozzleGeometry
-from evaluators import CFDSimulation, EvaluationResult
+from evaluators import EvaluationResult
 
 
 @dataclass
@@ -15,7 +15,7 @@ class BenchmarkSuite:
 
     mocGeometry: NozzleGeometry
     optimizedGeometry: NozzleGeometry
-    evaluator: CFDSimulation
+    evaluator: Any
     mocResult: Optional[EvaluationResult] = None
     optResult: Optional[EvaluationResult] = None
 
