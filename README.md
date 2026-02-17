@@ -1,82 +1,77 @@
 # nozzle-design-benchmark
 
-## Overview
+Framework computacional para comparar diseno de toberas supersonicas por:
+- Metodo de las Caracteristicas (MOC)
+- Evaluacion CFD-like (referencia de mayor fidelidad)
+- Optimizacion computacional (GA/CMA-ES-like/Bayesian-like)
 
-**nozzle-design-benchmark** is a fully computational research framework for benchmarking supersonic nozzle design methodologies.
+## Objetivo
+Cuantificar cuando MOC es suficiente como diseno preliminar y cuando la fidelidad CFD cambia de forma relevante el desempeno (empuje/perdidas).
 
-The project focuses on evaluating the **Method of Characteristics (MOC)** as a preliminary design tool by comparing its results against higher-fidelity **CFD-based evaluations** and against geometries obtained through computational optimization. The goal is not to replace classical analytical methods, but to **quantify their accuracy, limitations, and applicability** under non-ideal flow conditions.
+## Estructura
+- `geometry/`: generacion de geometria (MOC y parametrica)
+- `evaluators/`: evaluadores (`CFDSimulation`, `FastEvaluator`)
+- `optimization/`: optimizador y runner
+- `benchmarks/`: comparacion MOC vs optimizado
+- `analysis/`: reporte y metricas
+- `main_pipeline.py`: pipeline completo en una ejecucion
 
-This repository is designed for academic and research use and supports reproducible, methodical comparison between classical theory and numerical optimization.
+## Instalacion
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
 
----
+## Ejecucion rapida
+Pipeline completo:
+```bash
+python main_pipeline.py
+```
 
-## Motivation
+Los defaults del pipeline representan un caso de tobera de alta expansion en condicion de gran altitud (`ambient_pressure = 10000 Pa`).
 
-The Method of Characteristics is widely used in the preliminary design of supersonic nozzles due to its simplicity and low computational cost. However, MOC assumes ideal, isentropic flow and imposes specific geometric constraints that may not remain optimal once real-flow effects are considered.
+Con algoritmo especifico:
+```bash
+python main_pipeline.py --algorithm ga
+python main_pipeline.py --algorithm bayesian
+python main_pipeline.py --algorithm cma-es
+python main_pipeline.py --algorithm grid
+```
 
-Computational Fluid Dynamics (CFD) allows these non-ideal effects to be modeled but comes at a significantly higher computational cost. This raises fundamental design questions:
+Salida personalizada:
+```bash
+python main_pipeline.py --out out/mi_estudio
+```
 
-- When is MOC sufficiently accurate for preliminary nozzle design?
-- How large is the performance penalty when relying solely on MOC?
-- Under what conditions does CFD-based analysis become necessary?
-- How close is a classical MOC design to a CFD-optimal geometry?
+Con archivo de configuracion JSON:
+```bash
+python main_pipeline.py --config docs/example_config.json
+```
 
-This project addresses these questions by establishing a **computational benchmark** where MOC-based designs are evaluated against CFD results and against an optimized CFD reference nozzle.
+## Artefactos generados
+En `out/pipeline/` (o el `--out` elegido):
+- `moc_geometry.csv`, `optimized_geometry.csv`
+- `moc_geometry.png`, `optimized_geometry.png`
+- `moc_result.json`, `optimized_result.json`, `comparison.json`
+- `optimization_history.json`, `best_result.json`
+- `moc_fields.png`, `optimized_fields.png`
+- `report.md`, `report.json`, `summary.json`
 
----
+## Scripts individuales
+- `python main_moc_pipeline.py`
+- `python main_optimizer.py`
+- `python main_benchmark.py`
 
-## Role of Computational Intelligence
+## Notas metodologicas
+- `CFDSimulation` ahora usa un modelo quasi-1D mas realista:
+  - columna vertebral area-Mach compresible,
+  - reduccion de area efectiva por capa limite desplazada,
+  - perdidas de presion total por friccion y curvatura,
+  - correccion por choque normal en salida sobreexpandida (opcional),
+  - penalizacion por divergencia de flujo en salida (`eta_div`).
+- Parametros fisicos ajustables en `evaluator`: `friction_scale`, `cf_multiplier`, `curvature_scale`, `bl_displacement_scale`, `discharge_coefficient`, `enable_shock_model`, `divergence_scale`.
+- La optimizacion no reemplaza MOC; se usa para obtener una referencia de desempeno bajo el mismo evaluador.
 
-Computational Intelligence (CI) methods are used **strictly as an evaluation and benchmarking tool**, not as a black-box replacement for analytical theory.
-
-Optimization algorithms explore a parametrized nozzle geometry space and use CFD as a high-fidelity evaluator. The resulting optimized geometry represents a **performance reference** under the chosen modeling assumptions.
-
-This reference allows the performance of MOC-derived geometries to be objectively measured and contextualized.
-
-In this framework:
-- CI provides a performance upper bound.
-- CFD provides physical fidelity.
-- MOC provides a classical baseline.
-
----
-
-## Scope and Assumptions
-
-- The project is **fully computational**.
-- No experimental manufacturing or testing is considered.
-- Axisymmetric nozzle geometries are assumed.
-- Flow solvers may range from simplified evaluators (early stages) to full CFD simulations.
-- The framework is modular and extensible by design.
-
----
-
-## Repository Structure
-
-```text
-nozzle-design-benchmark/
-│
-├── geometry/        # Parametrized nozzle geometry generation and constraints
-├── evaluators/      # Flow evaluators (isentropic, CFD interfaces, etc.)
-├── optimization/    # Optimization algorithms and search strategies
-├── benchmarks/      # Comparative studies (MOC vs CFD vs optimized designs)
-├── analysis/        # Post-processing, plots, and paper-ready figures
-├── docs/            # Technical notes, assumptions, and design decisions
-└── README.md
-
--- 
-## Intended Use
-
-This repository is intended to support:
-
-- Academic research and conference papers
-
-- Methodological studies in propulsion and compressible flow
-
-- Educational exploration of nozzle design tradeoffs
-
-- Reproducible benchmarking of design methodologies
-
-It is not intended as a production design tool for flight hardware.
-
---
-## License MIT
+## Licencia
+MIT
