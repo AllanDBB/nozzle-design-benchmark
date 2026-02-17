@@ -95,6 +95,8 @@ puedes temporalmente usar:
 - `fallback_on_failure: true` para no cortar el pipeline,
 - y luego relanzar solo las mejores geometrías en modo estricto.
 
+Adicionalmente, el optimizador penaliza candidatos que fallan en RANS (en lugar de abortar toda la corrida).
+
 ## Artefactos generados
 En `out/pipeline/` (o el `--out` elegido):
 - `moc_geometry.csv`, `optimized_geometry.csv`

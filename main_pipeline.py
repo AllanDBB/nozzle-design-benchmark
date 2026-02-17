@@ -7,7 +7,7 @@ from typing import Dict, Any
 
 from analysis import AnalysisNote
 from benchmarks import BenchmarkSuite
-from evaluators import CFDSimulation, OpenFOAMRANSEvaluator
+from evaluators import CFDSimulation, OpenFOAMRANSEvaluator, EvaluationResult
 from geometry import MOCSolver, NozzleGeometry
 from optimization import Optimizer, OptimizationRunner
 
@@ -121,9 +121,19 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         gid = f"opt_candidate_{len(optimizer._history):04d}"
         geom = build_geometry_from_params(param_dict, throat, n_points, profile, gid)
         evaluator.geometry = geom
-        result = evaluator.extractResults()
-        result.geometryId = gid
-        return result
+        try:
+            result = evaluator.extractResults()
+            result.geometryId = gid
+            return result
+        except Exception as exc:
+            # Penalize failed CFD candidates so optimization can continue.
+            return EvaluationResult(
+                machProfile=[],
+                pressureLoss=1.0,
+                thrust=-1.0e30,
+                geometryId=gid,
+                metadata={"status": "failed", "error": str(exc), "params": dict(param_dict)},
+            )
 
     optimizer = Optimizer(
         searchSpace={k: v for k, v in opt_cfg.items() if k != "algorithm" and k != "seed"},
@@ -147,16 +157,26 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     # 3) Benchmark MOC vs optimized with same evaluator.
     bench_eval = make_evaluator(moc_geometry)
     suite = BenchmarkSuite(mocGeometry=moc_geometry, optimizedGeometry=optimized_geometry, evaluator=bench_eval)
-    suite.runAll()
-    comparison = suite.save(str(out_dir))
+    comparison: Dict[str, Any]
+    benchmark_error = ""
+    try:
+        suite.runAll()
+        comparison = suite.save(str(out_dir))
 
-    bench_eval.geometry = moc_geometry
-    bench_eval.extractResults()
-    bench_eval.plotFields(str(out_dir / "moc_fields.png"))
+        bench_eval.geometry = moc_geometry
+        bench_eval.extractResults()
+        bench_eval.plotFields(str(out_dir / "moc_fields.png"))
 
-    bench_eval.geometry = optimized_geometry
-    bench_eval.extractResults()
-    bench_eval.plotFields(str(out_dir / "optimized_fields.png"))
+        bench_eval.geometry = optimized_geometry
+        bench_eval.extractResults()
+        bench_eval.plotFields(str(out_dir / "optimized_fields.png"))
+    except Exception as exc:
+        benchmark_error = str(exc)
+        comparison = {
+            "status": "failed",
+            "error": benchmark_error,
+        }
+        (out_dir / "comparison.json").write_text(json.dumps(comparison, indent=2), encoding="utf-8")
 
     # 4) Analysis report.
     note = AnalysisNote(
@@ -176,6 +196,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     note.saveJSON(str(out_dir / "report.json"))
 
     summary = {
+        "status": "ok" if not benchmark_error else "failed",
         "out_dir": str(out_dir),
         "moc_geometry": str(out_dir / "moc_geometry.csv"),
         "optimized_geometry": str(out_dir / "optimized_geometry.csv"),

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from evaluators import CFDSimulation, OpenFOAMRANSEvaluator
+from evaluators import CFDSimulation, OpenFOAMRANSEvaluator, EvaluationResult
 from geometry import NozzleGeometry
 from optimization import Optimizer, OptimizationRunner
 
@@ -63,7 +63,16 @@ def main() -> None:
             }
         )
         evaluator.geometry = geom
-        return evaluator.extractResults()
+        try:
+            return evaluator.extractResults()
+        except Exception as exc:
+            return EvaluationResult(
+                machProfile=[],
+                pressureLoss=1.0,
+                thrust=-1.0e30,
+                geometryId="opt_candidate_failed",
+                metadata={"status": "failed", "error": str(exc), "params": dict(params)},
+            )
 
     optimizer = Optimizer(
         searchSpace={

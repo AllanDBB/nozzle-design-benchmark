@@ -148,17 +148,17 @@ solvers
 {
     p
     {
-        solver GAMG;
+        solver smoothSolver;
+        smoother symGaussSeidel;
         tolerance 1e-7;
-        relTol 0.01;
-        smoother DICGaussSeidel;
+        relTol 0.05;
     }
 
     "(U|e|k|epsilon)"
     {
         solver smoothSolver;
         smoother symGaussSeidel;
-        tolerance 1e-8;
+        tolerance 1e-7;
         relTol 0.05;
     }
 }
@@ -178,14 +178,14 @@ relaxationFactors
 {
     fields
     {
-        p 0.4;
+        p 0.2;
     }
     equations
     {
-        U 0.5;
-        e 0.7;
-        k 0.7;
-        epsilon 0.7;
+        U 0.3;
+        e 0.4;
+        k 0.4;
+        epsilon 0.4;
     }
 }
 """
