@@ -56,6 +56,16 @@ docker compose run --rm nozzle python3 main_pipeline.py --config docs/rans_2d_he
 docker compose run --rm nozzle python3 main_pipeline.py --config docs/rans_3d_heavy.json
 ```
 
+### Caso 2D ultra (muy pesado, alta exploración)
+```bash
+docker compose run --rm nozzle python3 main_pipeline.py --config docs/rans_2d_ultra.json
+```
+
+### Caso 3D ultra (muy pesado, alta exploración)
+```bash
+docker compose run --rm nozzle python3 main_pipeline.py --config docs/rans_3d_ultra.json
+```
+
 ## 5) Donde quedan los resultados
 ### 2D
 - `out/test_rans_2d/summary.json`
@@ -132,6 +142,8 @@ Define cuanto explora la búsqueda:
 - 2D quick: normalmente minutos
 - 3D quick: más lento que 2D
 - Si subes malla o `n_samples`, sube tiempo de forma importante
+- 2D ultra: puede tardar horas (depende de CPU y convergencia)
+- 3D ultra: puede tardar varias horas
 
 En CFD compresible, es normal que algunos candidatos no converjan.
 Por eso se recomienda:
@@ -149,6 +161,10 @@ Si pasa eso, usa perfiles `heavy` y/o sube:
 - malla (`mesh_nx`, `mesh_ny`, `mesh_nz`)
 - evaluaciones de optimización (`population`, `generations`)
 - tiempo de solver (`end_time`)
+
+Para máxima calidad de esta base:
+- `docs/rans_2d_ultra.json`
+- `docs/rans_3d_ultra.json`
 
 ## 9) Modo estricto RANS (solo si quieres forzar todo CFD)
 Archivos:
