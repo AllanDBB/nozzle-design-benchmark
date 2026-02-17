@@ -19,7 +19,7 @@ class OpenFOAMRANSEvaluator:
 
     Supports:
     - 2D planar (single-cell thickness, front/back = empty)
-    - 3D channel (finite depth, front/back = symmetryPlane)
+    - 3D channel (finite depth, front/back = wall)
     """
 
     geometry: NozzleGeometry
@@ -100,16 +100,16 @@ gradSchemes
 divSchemes
 {
     default none;
-    div(phi,U)      Gauss upwind;
+    div(phi,U)      bounded Gauss upwind;
     div(phi,(p|rho)) Gauss upwind;
     div(phi,p)      Gauss upwind;
     div(phi,rho)    Gauss upwind;
     div(phid,p)     Gauss upwind;
-    div(phi,e)      Gauss upwind;
+    div(phi,e)      bounded Gauss upwind;
     div(phi,h)      Gauss upwind;
     div(phi,K)      Gauss upwind;
-    div(phi,epsilon)  Gauss upwind;
-    div(phi,k)      Gauss upwind;
+    div(phi,epsilon)  bounded Gauss upwind;
+    div(phi,k)      bounded Gauss upwind;
     div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;
 }
 
@@ -151,7 +151,7 @@ solvers
         solver smoothSolver;
         smoother symGaussSeidel;
         tolerance 1e-7;
-        relTol 0.05;
+        relTol 0.01;
     }
 
     "(U|e|k|epsilon)"
@@ -159,7 +159,7 @@ solvers
         solver smoothSolver;
         smoother symGaussSeidel;
         tolerance 1e-7;
-        relTol 0.05;
+        relTol 0.01;
     }
 }
 
@@ -178,14 +178,14 @@ relaxationFactors
 {
     fields
     {
-        p 0.2;
+        p 0.12;
     }
     equations
     {
-        U 0.3;
-        e 0.4;
-        k 0.4;
-        epsilon 0.4;
+        U 0.2;
+        e 0.2;
+        k 0.2;
+        epsilon 0.2;
     }
 }
 """
@@ -281,8 +281,9 @@ nu              [0 2 -1 0 0 0 0] 1.5e-05;
             nz = int(self.solverConfig.get("mesh_nz", 12))
             z0 = -0.5 * depth
             z1 = 0.5 * depth
-            front_type = "symmetryPlane"
-            back_type = "symmetryPlane"
+            # True 3D channel: z faces are walls (not symmetry planes).
+            front_type = "wall"
+            back_type = "wall"
 
         points = self.geometry.control_points
         top0 = points[0][1]
@@ -403,8 +404,8 @@ dimensions [1 -1 -2 0 0 0 0];
 internalField uniform {p_init};
 boundaryField
 {{
-    inlet {{ type totalPressure; p0 uniform {p0}; gamma 1.4; value uniform {pa}; }}
-    outlet {{ type totalPressure; p0 uniform {pa}; gamma 1.4; value uniform {pa}; }}
+    inlet {{ type totalPressure; p0 uniform {p0}; gamma 1.4; value uniform {p_init}; }}
+    outlet {{ type fixedValue; value uniform {pa}; }}
     upperWall {{ type zeroGradient; }}
     lowerWall {{ type zeroGradient; }}
     front {{ type empty; }}
@@ -424,8 +425,8 @@ dimensions [0 1 -1 0 0 0 0];
 internalField uniform ({u_init} 0 0);
 boundaryField
 {{
-    inlet {{ type pressureInletOutletVelocity; value uniform ({u_in} 0 0); }}
-    outlet {{ type pressureInletOutletVelocity; value uniform (0 0 0); }}
+    inlet {{ type fixedValue; value uniform ({u_in} 0 0); }}
+    outlet {{ type inletOutlet; inletValue uniform ({u_init} 0 0); value uniform ({u_init} 0 0); }}
     upperWall {{ type noSlip; }}
     lowerWall {{ type noSlip; }}
     front {{ type empty; }}
@@ -446,7 +447,7 @@ internalField uniform {t_init};
 boundaryField
 {{
     inlet {{ type totalTemperature; T0 uniform {t0}; gamma 1.4; value uniform {t0}; }}
-    outlet {{ type zeroGradient; }}
+    outlet {{ type inletOutlet; inletValue uniform {t_init}; value uniform {t_init}; }}
     upperWall {{ type zeroGradient; }}
     lowerWall {{ type zeroGradient; }}
     front {{ type empty; }}
@@ -467,7 +468,7 @@ internalField uniform {k_in};
 boundaryField
 {{
     inlet {{ type fixedValue; value uniform {k_in}; }}
-    outlet {{ type inletOutlet; inletValue uniform {k_in}; value uniform {k_in}; }}
+    outlet {{ type zeroGradient; }}
     upperWall {{ type kqRWallFunction; value uniform 1e-10; }}
     lowerWall {{ type kqRWallFunction; value uniform 1e-10; }}
     front {{ type empty; }}
@@ -488,7 +489,7 @@ internalField uniform {epsilon_in};
 boundaryField
 {{
     inlet {{ type fixedValue; value uniform {epsilon_in}; }}
-    outlet {{ type inletOutlet; inletValue uniform {epsilon_in}; value uniform {epsilon_in}; }}
+    outlet {{ type zeroGradient; }}
     upperWall {{ type epsilonWallFunction; value uniform 1e-10; }}
     lowerWall {{ type epsilonWallFunction; value uniform 1e-10; }}
     front {{ type empty; }}
@@ -539,15 +540,44 @@ boundaryField
 
         mode = str(self.solverConfig.get("dimension", "2d_planar"))
         if mode != "2d_planar":
-            for field_txt in (p_txt, u_txt, t_txt, k_txt, eps_txt, nut_txt):
-                field_txt = field_txt.replace("type empty;", "type symmetryPlane;")
-            p_txt = p_txt.replace("type empty;", "type symmetryPlane;")
-            u_txt = u_txt.replace("type empty;", "type symmetryPlane;")
-            t_txt = t_txt.replace("type empty;", "type symmetryPlane;")
-            k_txt = k_txt.replace("type empty;", "type symmetryPlane;")
-            eps_txt = eps_txt.replace("type empty;", "type symmetryPlane;")
-            nut_txt = nut_txt.replace("type empty;", "type symmetryPlane;")
-            alphat_txt = alphat_txt.replace("type empty;", "type symmetryPlane;")
+            p_txt = p_txt.replace("front { type empty; }", "front { type zeroGradient; }")
+            p_txt = p_txt.replace("back { type empty; }", "back { type zeroGradient; }")
+
+            u_txt = u_txt.replace("front { type empty; }", "front { type noSlip; }")
+            u_txt = u_txt.replace("back { type empty; }", "back { type noSlip; }")
+
+            t_txt = t_txt.replace("front { type empty; }", "front { type zeroGradient; }")
+            t_txt = t_txt.replace("back { type empty; }", "back { type zeroGradient; }")
+
+            k_txt = k_txt.replace(
+                "front { type empty; }", "front { type kqRWallFunction; value uniform 1e-10; }"
+            )
+            k_txt = k_txt.replace(
+                "back { type empty; }", "back { type kqRWallFunction; value uniform 1e-10; }"
+            )
+
+            eps_txt = eps_txt.replace(
+                "front { type empty; }", "front { type epsilonWallFunction; value uniform 1e-10; }"
+            )
+            eps_txt = eps_txt.replace(
+                "back { type empty; }", "back { type epsilonWallFunction; value uniform 1e-10; }"
+            )
+
+            nut_txt = nut_txt.replace(
+                "front { type empty; }", "front { type nutkWallFunction; value uniform 0; }"
+            )
+            nut_txt = nut_txt.replace(
+                "back { type empty; }", "back { type nutkWallFunction; value uniform 0; }"
+            )
+
+            alphat_txt = alphat_txt.replace(
+                "front { type empty; }",
+                "front { type compressible::alphatWallFunction; value uniform 0; }",
+            )
+            alphat_txt = alphat_txt.replace(
+                "back { type empty; }",
+                "back { type compressible::alphatWallFunction; value uniform 0; }",
+            )
 
         (case_dir / "0" / "p").write_text(p_txt, encoding="utf-8")
         (case_dir / "0" / "U").write_text(u_txt, encoding="utf-8")

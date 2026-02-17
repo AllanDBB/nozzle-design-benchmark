@@ -111,12 +111,22 @@ class CFDSimulation:
         shock_model = bool(self.solverConfig.get("enable_shock_model", True))
         shock_trigger_ratio = float(self.solverConfig.get("shock_trigger_ratio", 0.55))
         divergence_scale = float(self.solverConfig.get("divergence_scale", 1.0))
+        dimension_mode = str(self.solverConfig.get("dimension", "axisymmetric"))
+        depth = float(self.solverConfig.get("depth", 0.02))
 
         xs = [i * self.geometry.length / (n_samples - 1) for i in range(n_samples)]
         ys = [self.geometry.y_at(x) for x in xs]
 
-        area_raw = [math.pi * y * y for y in ys]
-        a_throat = math.pi * self.geometry.throat_radius * self.geometry.throat_radius
+        if dimension_mode in ("2d_planar", "3d_channel"):
+            area_raw = [2.0 * y * depth for y in ys]
+            wetted_perimeter = [
+                2.0 * depth if dimension_mode == "2d_planar" else 2.0 * (2.0 * y + depth) for y in ys
+            ]
+            a_throat = 2.0 * self.geometry.throat_radius * depth
+        else:
+            area_raw = [math.pi * y * y for y in ys]
+            wetted_perimeter = [2.0 * math.pi * y for y in ys]
+            a_throat = math.pi * self.geometry.throat_radius * self.geometry.throat_radius
 
         # Effective area: boundary layer displacement thickness reduces available flow area.
         re_ref = float(self.solverConfig.get("reynolds_reference", 2.0e6))
@@ -128,7 +138,10 @@ class CFDSimulation:
             re_factor = max((re_ref / 2.0e6) ** -0.2, 0.4)
             delta_star = bl_scale * delta0 * re_factor * math.sqrt(max(s, 0.0))
             y_eff = max(y - delta_star, 0.35 * y)
-            area_eff.append(math.pi * y_eff * y_eff)
+            if dimension_mode in ("2d_planar", "3d_channel"):
+                area_eff.append(2.0 * y_eff * depth)
+            else:
+                area_eff.append(math.pi * y_eff * y_eff)
 
         mach_profile: List[float] = []
         temp_profile: List[float] = []
@@ -149,7 +162,7 @@ class CFDSimulation:
             u = m * a_sound
             rho = p_static / (r * max(tt, 1e-6))
             mu = self._mu_sutherland(tt)
-            dh = max(2.0 * ys[i], 1e-6)
+            dh = max(4.0 * area_eff[i] / max(wetted_perimeter[i], 1e-9), 1e-6)
             re = max(rho * u * dh / max(mu, 1e-12), 1e3)
 
             # Turbulent skin-friction (smooth-wall proxy).
@@ -212,7 +225,10 @@ class CFDSimulation:
         )
         mdot = float(self.solverConfig.get("mass_flow", mdot_choked))
 
-        a_exit = math.pi * (self.geometry.exit_radius ** 2)
+        if dimension_mode in ("2d_planar", "3d_channel"):
+            a_exit = 2.0 * self.geometry.exit_radius * depth
+        else:
+            a_exit = math.pi * (self.geometry.exit_radius ** 2)
         thrust = mdot * v_exit * eta_div + (p_exit - pa) * a_exit
 
         # Non-ideal pressure loss relative to inlet total pressure.
@@ -238,6 +254,7 @@ class CFDSimulation:
                 "shock_applied": shock_applied,
                 "exit_angle_rad": exit_angle,
                 "eta_div": eta_div,
+                "dimension": dimension_mode,
             },
         )
         return self._lastResult

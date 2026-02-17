@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any
 
-from analysis import AnalysisNote
+from analysis import AnalysisNote, generate_comparison_plots
 from benchmarks import BenchmarkSuite
 from evaluators import CFDSimulation, OpenFOAMRANSEvaluator, EvaluationResult
 from geometry import MOCSolver, NozzleGeometry
@@ -162,6 +162,15 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     try:
         suite.runAll()
         comparison = suite.save(str(out_dir))
+        if suite.mocResult is not None and suite.optResult is not None:
+            generate_comparison_plots(
+                moc_geometry=moc_geometry,
+                optimized_geometry=optimized_geometry,
+                moc_result=suite.mocResult,
+                optimized_result=suite.optResult,
+                out_dir=str(out_dir),
+                solver_config=eval_cfg,
+            )
 
         bench_eval.geometry = moc_geometry
         bench_eval.extractResults()
