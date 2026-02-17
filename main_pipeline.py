@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any
 
-from analysis import AnalysisNote, generate_comparison_plots
+from analysis import AnalysisNote, generate_comparison_plots, generate_optimization_plots
 from benchmarks import BenchmarkSuite
 from evaluators import CFDSimulation, OpenFOAMRANSEvaluator, EvaluationResult
 from geometry import MOCSolver, NozzleGeometry
@@ -163,6 +163,18 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     try:
         suite.runAll()
         comparison = suite.save(str(out_dir))
+        generate_optimization_plots(
+            history=optimizer._history,
+            out_dir=str(out_dir),
+            moc_thrust=suite.mocResult.thrust if suite.mocResult is not None else None,
+            population=int(opt_cfg.get("population", 0)) if str(opt_cfg.get("algorithm", "")).lower() in {"ga", "cma-es", "evolutionary"} else None,
+            moc_geometry=moc_geometry,
+            throat_radius=throat,
+            n_points=n_points,
+            profile=profile,
+            gamma=float(eval_cfg.get("gamma", 1.4)),
+            gas_constant=float(eval_cfg.get("gas_constant", 287.0)),
+        )
         if suite.mocResult is not None and suite.optResult is not None:
             generate_comparison_plots(
                 moc_geometry=moc_geometry,

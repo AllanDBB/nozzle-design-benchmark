@@ -27,6 +27,22 @@ def _velocity_profile(mach: List[float], temp: List[float], gamma: float, gas_co
     return vel
 
 
+def _legend_unique() -> None:
+    ax = plt.gca()
+    handles, labels = ax.get_legend_handles_labels()
+    seen = set()
+    h2 = []
+    l2 = []
+    for h, l in zip(handles, labels):
+        if l in seen:
+            continue
+        seen.add(l)
+        h2.append(h)
+        l2.append(l)
+    if l2:
+        ax.legend(h2, l2)
+
+
 def generate_comparison_plots(
     moc_geometry: NozzleGeometry,
     optimized_geometry: NozzleGeometry,
@@ -56,7 +72,7 @@ def generate_comparison_plots(
     plt.title("Geometry Comparison")
     plt.grid(True, alpha=0.3)
     plt.axis("equal")
-    plt.legend()
+    _legend_unique()
     plt.tight_layout()
     plt.savefig(out / "compare_geometry.png", dpi=180)
     plt.close()
@@ -72,7 +88,7 @@ def generate_comparison_plots(
         plt.ylabel("Mach")
         plt.title("Mach Along Nozzle")
         plt.grid(True, alpha=0.3)
-        plt.legend()
+        _legend_unique()
         plt.tight_layout()
         plt.savefig(out / "compare_mach.png", dpi=180)
         plt.close()
@@ -90,7 +106,7 @@ def generate_comparison_plots(
         plt.ylabel("Velocity [m/s]")
         plt.title("Velocity Along Nozzle")
         plt.grid(True, alpha=0.3)
-        plt.legend()
+        _legend_unique()
         plt.tight_layout()
         plt.savefig(out / "compare_velocity.png", dpi=180)
         plt.close()
@@ -106,7 +122,7 @@ def generate_comparison_plots(
         plt.ylabel("Pressure [Pa]")
         plt.title("Pressure Along Nozzle")
         plt.grid(True, alpha=0.3)
-        plt.legend()
+        _legend_unique()
         plt.tight_layout()
         plt.savefig(out / "compare_pressure.png", dpi=180)
         plt.close()
@@ -122,7 +138,7 @@ def generate_comparison_plots(
         plt.ylabel("Temperature [K]")
         plt.title("Temperature Along Nozzle")
         plt.grid(True, alpha=0.3)
-        plt.legend()
+        _legend_unique()
         plt.tight_layout()
         plt.savefig(out / "compare_temperature.png", dpi=180)
         plt.close()
@@ -140,7 +156,7 @@ def generate_comparison_plots(
     plt.xticks(x, labels)
     plt.title("Performance Comparison")
     plt.grid(True, axis="y", alpha=0.3)
-    plt.legend()
+    _legend_unique()
     plt.tight_layout()
     plt.savefig(out / "compare_performance.png", dpi=180)
     plt.close()
