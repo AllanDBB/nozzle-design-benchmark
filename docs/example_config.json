@@ -47,6 +47,10 @@
     },
     "n_points": 200,
     "profile": "bezier_like",
-    "n_samples": 3
+    "n_samples": 3,
+    "w_thrust": 1.0,
+    "w_pressure_loss": 0.0,
+    "use_pareto_knee": false,
+    "n_workers": 1
   }
 }

@@ -1,0 +1,50 @@
+{
+  "_comment": "Local test config — no Docker or OpenFOAM required. Uses the quasi-1D CFD evaluator. Runs in ~5 seconds.",
+  "_usage": "python main_pipeline.py --config docs/local_quick_test.json",
+  "out_dir": "out/local_quick_test",
+  "moc": {
+    "mach_exit": 2.4,
+    "pressure_ratio": 0.09,
+    "gamma": 1.4,
+    "geometry": {
+      "throat_y": 0.02,
+      "exit_y": 0.062,
+      "length": 0.22,
+      "n_points": 120
+    }
+  },
+  "evaluator": {
+    "backend": "quasi1d",
+    "gamma": 1.4,
+    "stagnation_temperature": 1000.0,
+    "stagnation_pressure": 600000.0,
+    "ambient_pressure": 80000.0,
+    "n_samples": 60,
+    "friction_scale": 0.2,
+    "cf_multiplier": 1.0,
+    "curvature_scale": 0.05,
+    "bl_displacement_scale": 1.0,
+    "discharge_coefficient": 0.985,
+    "enable_shock_model": true,
+    "shock_trigger_ratio": 0.55,
+    "divergence_scale": 1.0,
+    "fallback_on_failure": false,
+    "use_gpu": false
+  },
+  "optimization": {
+    "algorithm": "random",
+    "seed": 42,
+    "bounds": {
+      "exit_radius": [0.055, 0.075],
+      "length": [0.20, 0.28],
+      "shape": [1.4, 2.2]
+    },
+    "n_samples": 5,
+    "n_points": 120,
+    "profile": "bezier_like",
+    "w_thrust": 1.0,
+    "w_pressure_loss": 0.0,
+    "use_pareto_knee": false,
+    "n_workers": 1
+  }
+}

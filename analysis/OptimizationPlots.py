@@ -34,6 +34,7 @@ def generate_optimization_plots(
     history: Iterable[Any],
     out_dir: str,
     moc_thrust: Optional[float] = None,
+    moc_pressure_loss: Optional[float] = None,
     population: Optional[int] = None,
     moc_geometry: Optional[NozzleGeometry] = None,
     throat_radius: Optional[float] = None,
@@ -85,6 +86,8 @@ def generate_optimization_plots(
     plt.figure(figsize=(9, 4.5))
     plt.plot(xs, losses, color="tab:red", alpha=0.45, linewidth=1.0, label="Candidate pressure loss")
     plt.plot(xs, best_loss, color="tab:purple", linewidth=2.0, label="Best-so-far pressure loss")
+    if moc_pressure_loss is not None:
+        plt.axhline(float(moc_pressure_loss), color="tab:green", linestyle="--", linewidth=1.3, label="MOC pressure loss")
     if population and population > 0:
         for g in range(population, len(xs), population):
             plt.axvline(g - 0.5, color="gray", alpha=0.15, linewidth=0.8)

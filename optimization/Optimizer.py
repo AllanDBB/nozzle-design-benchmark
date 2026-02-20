@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Any, Callable, List, Tuple
+from typing import Dict, Any, Callable, List, Tuple, Optional
 import random
 import math
+import threading
+import itertools
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from evaluators import EvaluationResult
 
 
 @dataclass
 class Optimizer:
-    """Flexible optimization driver over a parametrized search space."""
+    """Flexible optimization driver over a parametrized search space.
+
+    Supports parallel batch evaluation (set ``n_workers`` > 1 in searchSpace)
+    and weighted multi-objective scoring (``w_thrust`` + ``w_pressure_loss``).
+    """
 
     searchSpace: Dict[str, Any]
     objectiveFunc: Callable[[Dict[str, float]], EvaluationResult]
@@ -18,6 +25,40 @@ class Optimizer:
     seed: int = 42
     _history: List[EvaluationResult] = field(default_factory=list)
     _history_params: List[Dict[str, float]] = field(default_factory=list)
+    # Thread-safety primitives (not included in repr/comparison).
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
+    _counter: Any = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._counter = itertools.count(0)
+
+    # ------------------------------------------------------------------ #
+    #  Multi-objective scoring helpers                                     #
+    # ------------------------------------------------------------------ #
+
+    def _w_thrust(self) -> float:
+        return float(self.searchSpace.get("w_thrust", 1.0))
+
+    def _w_loss(self) -> float:
+        return float(self.searchSpace.get("w_pressure_loss", 0.0))
+
+    def _objective_score(self, result: EvaluationResult) -> float:
+        """Weighted score: maximize thrust, minimize pressure loss.
+
+        Higher is always better (for consistent parent/best selection).
+        """
+        wt = self._w_thrust()
+        wl = self._w_loss()
+        total = max(wt + wl, 1e-9)
+        # Normalise pressure loss to [0..1] heuristic: penalise loss contribution.
+        return (wt / total) * result.thrust - (wl / total) * result.pressureLoss * result.thrust
+
+    def _best_idx(self) -> int:
+        return max(range(len(self._history)), key=lambda i: self._objective_score(self._history[i]))
+
+    # ------------------------------------------------------------------ #
+    #  Search space helpers                                                #
+    # ------------------------------------------------------------------ #
 
     def _bounds(self) -> Dict[str, Tuple[float, float]]:
         bounds = self.searchSpace.get("bounds")
@@ -62,20 +103,75 @@ class Optimizer:
             out[k] = min(max(out[k], lo), hi)
         return out
 
+    # ------------------------------------------------------------------ #
+    #  Evaluation (single + batch)                                        #
+    # ------------------------------------------------------------------ #
+
+    def _next_id(self) -> int:
+        """Thread-safe evaluation counter."""
+        with self._lock:
+            return next(self._counter)
+
     def _evaluate(self, params: Dict[str, float]) -> EvaluationResult:
         result = self.objectiveFunc(params)
-        self._history.append(result)
-        self._history_params.append(dict(params))
+        with self._lock:
+            self._history.append(result)
+            self._history_params.append(dict(params))
         return result
+
+    def _evaluate_batch(self, candidates: List[Dict[str, float]]) -> List[EvaluationResult]:
+        """Evaluate a batch of candidates, in parallel when n_workers > 1.
+
+        Parallel workers require ``objectiveFunc`` to be thread-safe
+        (i.e. each call must create its own evaluator/state independently).
+        """
+        n_workers = int(self.searchSpace.get("n_workers", 1))
+        if n_workers <= 1 or len(candidates) <= 1:
+            return [self._evaluate(p) for p in candidates]
+
+        n_workers = min(n_workers, len(candidates))
+        index_map: Dict[int, Tuple[EvaluationResult, Dict[str, float]]] = {}
+
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(self.objectiveFunc, p): (idx, p)
+                for idx, p in enumerate(candidates)
+            }
+            for future in as_completed(futures):
+                idx, p = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = EvaluationResult(
+                        machProfile=[],
+                        pressureLoss=1.0,
+                        thrust=-1.0e30,
+                        geometryId=f"parallel_failed_{idx}",
+                        metadata={"status": "failed", "error": str(exc)},
+                    )
+                index_map[idx] = (result, p)
+
+        # Append to history in original candidate order for reproducibility.
+        results: List[EvaluationResult] = []
+        with self._lock:
+            for i in range(len(candidates)):
+                result, p = index_map[i]
+                self._history.append(result)
+                self._history_params.append(dict(p))
+                results.append(result)
+        return results
+
+    # ------------------------------------------------------------------ #
+    #  Algorithm implementations                                          #
+    # ------------------------------------------------------------------ #
 
     def _run_random(self, rng: random.Random) -> None:
         n = int(self.searchSpace.get("n_samples", 30))
-        for _ in range(n):
-            self._evaluate(self._sample_uniform(rng))
+        candidates = [self._sample_uniform(rng) for _ in range(n)]
+        self._evaluate_batch(candidates)
 
     def _run_grid(self) -> None:
-        for params in self._grid_candidates():
-            self._evaluate(params)
+        self._evaluate_batch(self._grid_candidates())
 
     def _run_evolutionary(self, rng: random.Random) -> None:
         pop_size = int(self.searchSpace.get("population", 18))
@@ -85,10 +181,13 @@ class Optimizer:
 
         population = [self._sample_uniform(rng) for _ in range(pop_size)]
         for _ in range(generations):
-            scored: List[Tuple[EvaluationResult, Dict[str, float]]] = []
-            for p in population:
-                scored.append((self._evaluate(p), p))
-            scored.sort(key=lambda x: x[0].thrust, reverse=True)
+            # Evaluate entire generation in one (potentially parallel) batch.
+            gen_results = self._evaluate_batch(population)
+
+            scored: List[Tuple[float, Dict[str, float]]] = [
+                (self._objective_score(r), p) for r, p in zip(gen_results, population)
+            ]
+            scored.sort(key=lambda x: x[0], reverse=True)
             parents = [dict(p) for _, p in scored[:elite]]
 
             new_pop = parents[:]
@@ -110,11 +209,12 @@ class Optimizer:
         n_iter = int(self.searchSpace.get("n_iter", 24))
         jitter = float(self.searchSpace.get("jitter", 0.08))
 
-        for _ in range(warmup):
-            self._evaluate(self._sample_uniform(rng))
+        # Parallel warmup batch.
+        warmup_cands = [self._sample_uniform(rng) for _ in range(warmup)]
+        self._evaluate_batch(warmup_cands)
 
         for _ in range(max(0, n_iter - warmup)):
-            idx_best = max(range(len(self._history)), key=lambda i: self._history[i].thrust)
+            idx_best = self._best_idx()
             best_p = self._history_params[idx_best]
             cand: Dict[str, float] = {}
             for k, (lo, hi) in self._bounds().items():
@@ -122,10 +222,16 @@ class Optimizer:
                 cand[k] = best_p[k] + rng.gauss(0.0, jitter * span)
             self._evaluate(self._clamp(cand))
 
+    # ------------------------------------------------------------------ #
+    #  Public API                                                         #
+    # ------------------------------------------------------------------ #
+
     def run(self) -> EvaluationResult:
         rng = random.Random(self.seed)
-        self._history = []
-        self._history_params = []
+        with self._lock:
+            self._history = []
+            self._history_params = []
+            self._counter = itertools.count(0)
 
         algo = self.algorithm.lower()
         if algo == "random":
@@ -141,7 +247,7 @@ class Optimizer:
 
         if not self._history:
             raise RuntimeError("Optimizer did not evaluate any candidates")
-        idx = max(range(len(self._history)), key=lambda i: self._history[i].thrust)
+        idx = self._best_idx()
         best = self._history[idx]
         best.metadata["best_params"] = self._history_params[idx]
         return best
@@ -149,6 +255,12 @@ class Optimizer:
     def logBest(self) -> None:
         if not self._history:
             raise RuntimeError("No optimization history. Run optimizer first.")
-        idx = max(range(len(self._history)), key=lambda i: self._history[i].thrust)
+        idx = self._best_idx()
         best = self._history[idx]
-        print(f"Best thrust: {best.thrust:.3f} N | geometry={best.geometryId} | params={self._history_params[idx]}")
+        score = self._objective_score(best)
+        print(
+            f"Best score: {score:.4g} | thrust: {best.thrust:.3f} N | "
+            f"pressureLoss: {best.pressureLoss:.5f} | "
+            f"geometry={best.geometryId} | params={self._history_params[idx]}"
+        )
+

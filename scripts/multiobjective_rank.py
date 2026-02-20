@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 
@@ -95,34 +95,47 @@ def _legend_unique() -> None:
         ax.legend(h2, l2)
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Multi-objective ranking from existing optimization history.")
-    ap.add_argument("--history", required=True, help="Path to optimization_history.json")
-    ap.add_argument("--out", required=True, help="Output folder for ranking artifacts")
-    ap.add_argument("--w-thrust", type=float, default=0.7, help="Weight for thrust objective")
-    ap.add_argument("--w-loss", type=float, default=0.3, help="Weight for pressure loss objective")
-    ap.add_argument("--top-k", type=int, default=20, help="Top K records to save")
-    ap.add_argument("--moc-result", default="", help="Optional path to moc_result.json for comparison overlays")
-    args = ap.parse_args()
+def run_multiobjective(
+    records: List[Dict[str, Any]],
+    out_dir: str,
+    w_thrust: float = 0.7,
+    w_pressure_loss: float = 0.3,
+    top_k: int = 20,
+    moc_thrust: Optional[float] = None,
+    moc_loss: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Programmatic entry-point for multi-objective ranking.
 
-    out = Path(args.out)
+    Parameters
+    ----------
+    records:
+        List of evaluation result dicts (each needs 'thrust' and 'pressureLoss').
+    out_dir:
+        Folder where ranking artifacts and plots are written.
+    w_thrust / w_pressure_loss:
+        Relative objective weights (auto-normalised).
+    top_k:
+        Number of top-ranked candidates to save in the JSON artifact.
+    moc_thrust / moc_loss:
+        Optional MOC baseline values for overlay comparisons.
+
+    Returns
+    -------
+    Summary dictionary with Pareto front, best candidates, weights, etc.
+    """
+    if not records:
+        return {"error": "empty records", "n_candidates": 0}
+
+    out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    records = json.loads(Path(args.history).read_text(encoding="utf-8"))
-    if not isinstance(records, list) or not records:
-        raise RuntimeError("History file must contain a non-empty JSON list.")
-
-    for r in records:
-        if "thrust" not in r or "pressureLoss" not in r:
-            raise RuntimeError("Each history record must contain 'thrust' and 'pressureLoss'.")
-
-    w_sum = args.w_thrust + args.w_loss
+    w_sum = w_thrust + w_pressure_loss
     if w_sum <= 0.0:
-        raise RuntimeError("w-thrust + w-loss must be > 0")
-    w_thrust = args.w_thrust / w_sum
-    w_loss = args.w_loss / w_sum
+        w_sum = 1.0
+    wt = w_thrust / w_sum
+    wl = w_pressure_loss / w_sum
 
-    scored = _build_scored(records, w_thrust=w_thrust, w_loss=w_loss)
+    scored = _build_scored(records, w_thrust=wt, w_loss=wl)
     front_idx = _pareto_front(records)
     front = []
     for i in front_idx:
@@ -131,27 +144,18 @@ def main() -> None:
         front.append(rec)
     front.sort(key=lambda x: x["thrust"], reverse=True)
 
-    top_k = max(1, min(args.top_k, len(scored)))
+    top_k = max(1, min(top_k, len(scored)))
     top = scored[:top_k]
-
-    moc_thrust = None
-    moc_loss = None
-    if args.moc_result:
-        moc_data = json.loads(Path(args.moc_result).read_text(encoding="utf-8"))
-        if "thrust" in moc_data:
-            moc_thrust = float(moc_data["thrust"])
-        if "pressureLoss" in moc_data:
-            moc_loss = float(moc_data["pressureLoss"])
 
     best_by_thrust = max(enumerate(records), key=lambda x: float(x[1]["thrust"]))
     best_by_loss = min(enumerate(records), key=lambda x: float(x[1]["pressureLoss"]))
     knee = _knee_from_pareto(front)
 
-    summary = {
-        "history_path": str(Path(args.history)),
+    summary: Dict[str, Any] = {
         "n_candidates": len(records),
-        "weights": {"thrust": w_thrust, "pressure_loss": w_loss},
+        "weights": {"thrust": wt, "pressure_loss": wl},
         "n_dominated": len(records) - len(front),
+        "pareto_front_size": len(front),
         "best_by_score": {
             "candidate_index": int(top[0]["candidate_index"]),
             "score": float(top[0]["score"]),
@@ -178,13 +182,13 @@ def main() -> None:
             "knee_distance": float(knee.get("knee_distance", 0.0)),
             "params": knee.get("params", {}),
         },
-        "pareto_front_size": len(front),
     }
 
     (out / "multiobjective_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (out / "multiobjective_top.json").write_text(json.dumps(top, indent=2), encoding="utf-8")
     (out / "pareto_front.json").write_text(json.dumps(front, indent=2), encoding="utf-8")
 
+    # ── Pareto scatter ────────────────────────────────────────────────────
     thrusts = [float(r["thrust"]) for r in records]
     losses = [float(r["pressureLoss"]) for r in records]
     plt.figure(figsize=(7, 5))
@@ -204,13 +208,13 @@ def main() -> None:
     plt.savefig(out / "pareto_scatter.png", dpi=180)
     plt.close()
 
-    # Pareto curve (sorted by pressure loss)
+    # ── Pareto frontier curve ─────────────────────────────────────────────
     if front:
         sf = sorted(front, key=lambda r: float(r["pressureLoss"]))
         fx = [float(r["pressureLoss"]) for r in sf]
         fy = [float(r["thrust"]) for r in sf]
         plt.figure(figsize=(7, 5))
-        plt.plot(fx, fy, marker="o", linewidth=1.4, color="tab:orange")
+        plt.plot(fx, fy, marker="o", linewidth=1.4, color="tab:orange", label="Pareto frontier")
         if moc_thrust is not None and moc_loss is not None:
             plt.scatter([moc_loss], [moc_thrust], s=65, marker="X", color="tab:green", label="MOC")
         plt.xlabel("Pressure loss [-] (lower is better)")
@@ -222,36 +226,26 @@ def main() -> None:
         plt.savefig(out / "pareto_frontier_curve.png", dpi=180)
         plt.close()
 
-        # Zoomed Pareto with candidate labels for direct identification.
+        # ── Pareto zoom (labeled) ─────────────────────────────────────────
         plt.figure(figsize=(8, 5))
         plt.scatter(fx, fy, s=42, color="tab:orange", label="Pareto")
         for r in sf:
             x = float(r["pressureLoss"])
             y = float(r["thrust"])
             idx = int(r["candidate_index"])
-            plt.annotate(
-                f"{idx}",
-                (x, y),
-                xytext=(4, 4),
-                textcoords="offset points",
-                fontsize=8,
-                color="black",
-            )
+            plt.annotate(f"{idx}", (x, y), xytext=(4, 4), textcoords="offset points", fontsize=8)
         if moc_thrust is not None and moc_loss is not None:
             plt.scatter([moc_loss], [moc_thrust], s=75, marker="X", color="tab:green", label="MOC")
-            plt.annotate(
-                "MOC",
-                (moc_loss, moc_thrust),
-                xytext=(6, 6),
-                textcoords="offset points",
-                fontsize=9,
-                color="tab:green",
-            )
+            plt.annotate("MOC", (moc_loss, moc_thrust), xytext=(6, 6), textcoords="offset points",
+                         fontsize=9, color="tab:green")
         if fx and fy:
             xpad = max((max(fx) - min(fx)) * 0.35, 1e-4)
             ypad = max((max(fy) - min(fy)) * 0.35, 0.1)
-            plt.xlim(min(fx) - xpad, max(max(fx), moc_loss if moc_loss is not None else max(fx)) + xpad)
-            plt.ylim(min(min(fy), moc_thrust if moc_thrust is not None else min(fy)) - ypad, max(max(fy), moc_thrust if moc_thrust is not None else max(fy)) + ypad)
+            xmax = max(max(fx), moc_loss if moc_loss is not None else max(fx))
+            ymin = min(min(fy), moc_thrust if moc_thrust is not None else min(fy))
+            ymax = max(max(fy), moc_thrust if moc_thrust is not None else max(fy))
+            plt.xlim(min(fx) - xpad, xmax + xpad)
+            plt.ylim(ymin - ypad, ymax + ypad)
         plt.xlabel("Pressure loss [-] (lower is better)")
         plt.ylabel("Thrust [N] (higher is better)")
         plt.title("Pareto Zoom (Labeled by candidate index)")
@@ -261,9 +255,8 @@ def main() -> None:
         plt.savefig(out / "pareto_zoom_labeled.png", dpi=200)
         plt.close()
 
-    # Score by candidate index
-    idx = [int(r["candidate_index"]) for r in scored]
-    score_by_idx = [0.0 for _ in records]
+    # ── Score per candidate ───────────────────────────────────────────────
+    score_by_idx = [0.0] * len(records)
     for r in scored:
         score_by_idx[int(r["candidate_index"])] = float(r["score"])
     plt.figure(figsize=(8.5, 4.5))
@@ -276,17 +269,17 @@ def main() -> None:
     plt.savefig(out / "score_by_candidate.png", dpi=180)
     plt.close()
 
-    # Candidate index diagnostics with Pareto marks.
+    # ── Thrust / pressure-loss by candidate (with Pareto highlights) ──────
     pset = set(front_idx)
-    xs = list(range(len(records)))
+    xs_idx = list(range(len(records)))
     th = [float(r["thrust"]) for r in records]
     pl = [float(r["pressureLoss"]) for r in records]
-    pareto_x = [i for i in xs if i in pset]
+    pareto_x = [i for i in xs_idx if i in pset]
     pareto_th = [th[i] for i in pareto_x]
     pareto_pl = [pl[i] for i in pareto_x]
 
     plt.figure(figsize=(8.5, 4.5))
-    plt.scatter(xs, th, s=12, alpha=0.35, color="tab:gray", label="All")
+    plt.scatter(xs_idx, th, s=12, alpha=0.35, color="tab:gray", label="All")
     plt.scatter(pareto_x, pareto_th, s=24, alpha=0.95, color="tab:red", label="Pareto")
     if moc_thrust is not None:
         plt.axhline(moc_thrust, color="tab:green", linestyle="--", linewidth=1.2, label="MOC thrust")
@@ -300,7 +293,7 @@ def main() -> None:
     plt.close()
 
     plt.figure(figsize=(8.5, 4.5))
-    plt.scatter(xs, pl, s=12, alpha=0.35, color="tab:gray", label="All")
+    plt.scatter(xs_idx, pl, s=12, alpha=0.35, color="tab:gray", label="All")
     plt.scatter(pareto_x, pareto_pl, s=24, alpha=0.95, color="tab:red", label="Pareto")
     if moc_loss is not None:
         plt.axhline(moc_loss, color="tab:green", linestyle="--", linewidth=1.2, label="MOC pressure loss")
@@ -313,22 +306,25 @@ def main() -> None:
     plt.savefig(out / "pressure_loss_by_candidate_pareto.png", dpi=180)
     plt.close()
 
-    # Compact summary figure for reporting.
+    # ── Summary comparison table ──────────────────────────────────────────
     if moc_thrust is not None and moc_loss is not None:
         best_score = summary["best_by_score"]
-        best_thrust = summary["best_by_thrust"]
-        best_loss = summary["best_by_pressure_loss"]
+        best_thrust_pt = summary["best_by_thrust"]
+        best_loss_pt = summary["best_by_pressure_loss"]
         knee_pt = summary["best_pareto_knee"]
-
         fig, ax = plt.subplots(figsize=(9, 3.2))
         ax.axis("off")
         columns = ["Selection", "Candidate", "Thrust [N]", "Pressure loss [-]"]
         rows = [
             ["MOC", "-", f"{moc_thrust:.3f}", f"{moc_loss:.6f}"],
-            ["Best by score", str(best_score["candidate_index"]), f"{best_score['thrust']:.3f}", f"{best_score['pressureLoss']:.6f}"],
-            ["Best thrust", str(best_thrust["candidate_index"]), f"{best_thrust['thrust']:.3f}", f"{best_thrust['pressureLoss']:.6f}"],
-            ["Best loss", str(best_loss["candidate_index"]), f"{best_loss['thrust']:.3f}", f"{best_loss['pressureLoss']:.6f}"],
-            ["Pareto knee", str(knee_pt["candidate_index"]), f"{knee_pt['thrust']:.3f}", f"{knee_pt['pressureLoss']:.6f}"],
+            ["Best score", str(best_score["candidate_index"]),
+             f"{best_score['thrust']:.3f}", f"{best_score['pressureLoss']:.6f}"],
+            ["Best thrust", str(best_thrust_pt["candidate_index"]),
+             f"{best_thrust_pt['thrust']:.3f}", f"{best_thrust_pt['pressureLoss']:.6f}"],
+            ["Best loss", str(best_loss_pt["candidate_index"]),
+             f"{best_loss_pt['thrust']:.3f}", f"{best_loss_pt['pressureLoss']:.6f}"],
+            ["Pareto knee", str(knee_pt["candidate_index"]),
+             f"{knee_pt['thrust']:.3f}", f"{knee_pt['pressureLoss']:.6f}"],
         ]
         table = ax.table(cellText=rows, colLabels=columns, loc="center", cellLoc="center")
         table.auto_set_font_size(False)
@@ -338,6 +334,45 @@ def main() -> None:
         plt.tight_layout()
         plt.savefig(out / "moc_vs_best_table.png", dpi=180)
         plt.close()
+
+    return summary
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Multi-objective ranking from existing optimization history.")
+    ap.add_argument("--history", required=True, help="Path to optimization_history.json")
+    ap.add_argument("--out", required=True, help="Output folder for ranking artifacts")
+    ap.add_argument("--w-thrust", type=float, default=0.7, help="Weight for thrust objective")
+    ap.add_argument("--w-loss", type=float, default=0.3, help="Weight for pressure loss objective")
+    ap.add_argument("--top-k", type=int, default=20, help="Top K records to save")
+    ap.add_argument("--moc-result", default="", help="Optional path to moc_result.json for comparison overlays")
+    args = ap.parse_args()
+
+    records = json.loads(Path(args.history).read_text(encoding="utf-8"))
+    if not isinstance(records, list) or not records:
+        raise RuntimeError("History file must contain a non-empty JSON list.")
+    for r in records:
+        if "thrust" not in r or "pressureLoss" not in r:
+            raise RuntimeError("Each history record must contain 'thrust' and 'pressureLoss'.")
+
+    moc_thrust: Optional[float] = None
+    moc_loss: Optional[float] = None
+    if args.moc_result:
+        moc_data = json.loads(Path(args.moc_result).read_text(encoding="utf-8"))
+        moc_thrust = float(moc_data["thrust"]) if "thrust" in moc_data else None
+        moc_loss = float(moc_data["pressureLoss"]) if "pressureLoss" in moc_data else None
+
+    summary = run_multiobjective(
+        records=records,
+        out_dir=args.out,
+        w_thrust=args.w_thrust,
+        w_pressure_loss=args.w_loss,
+        top_k=args.top_k,
+        moc_thrust=moc_thrust,
+        moc_loss=moc_loss,
+    )
+    summary["history_path"] = str(Path(args.history))
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

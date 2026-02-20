@@ -75,6 +75,49 @@ writeCompression off;
 timeFormat      general;
 timePrecision   6;
 runTimeModifiable true;
+
+// Function objects: average outlet scalars and compute mass-flow rate.
+functions
+{{
+    outletScalars
+    {{
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        writeControl    writeTime;
+        surfaceFormat   none;
+        regionType      patch;
+        name            outlet;
+        operation       areaAverage;
+        fields          (p T);
+        writeFields     false;
+    }}
+
+    outletVelocity
+    {{
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        writeControl    writeTime;
+        surfaceFormat   none;
+        regionType      patch;
+        name            outlet;
+        operation       areaAverage;
+        fields          (U);
+        writeFields     false;
+    }}
+
+    outletMassFlow
+    {{
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        writeControl    writeTime;
+        surfaceFormat   none;
+        regionType      patch;
+        name            outlet;
+        operation       sum;
+        fields          (phi);
+        writeFields     false;
+    }}
+}}
 """
         (case_dir / "system" / "controlDict").write_text(txt, encoding="utf-8")
 
@@ -385,13 +428,30 @@ mergePatchPairs();
         p0 = float(self.solverConfig.get("stagnation_pressure", 1.5e6))
         t0 = float(self.solverConfig.get("stagnation_temperature", 1000.0))
         pa = float(self.solverConfig.get("ambient_pressure", 1.0e4))
-        u_in = float(self.solverConfig.get("inlet_velocity", 30.0))
         k_in = float(self.solverConfig.get("k_inlet", 5.0))
         epsilon_in = float(self.solverConfig.get("epsilon_inlet", 50.0))
         p_init = float(self.solverConfig.get("p_initial", 0.9 * p0))
-        u_init = float(self.solverConfig.get("u_initial", max(1.0, 0.05 * u_in)))
+        u_init = float(self.solverConfig.get("u_initial", 1.0))
         t_init = float(self.solverConfig.get("t_initial", t0))
+        mode = str(self.solverConfig.get("dimension", "2d_planar"))
+        is_2d = mode == "2d_planar"
+        front_p = "empty" if is_2d else "zeroGradient"
+        back_p = "empty" if is_2d else "zeroGradient"
+        front_u = "empty" if is_2d else "noSlip"
+        back_u = "empty" if is_2d else "noSlip"
+        front_t = "empty" if is_2d else "zeroGradient"
+        back_t = "empty" if is_2d else "zeroGradient"
+        front_k = "empty" if is_2d else "kqRWallFunction"
+        back_k = "empty" if is_2d else "kqRWallFunction"
+        front_eps = "empty" if is_2d else "epsilonWallFunction"
+        back_eps = "empty" if is_2d else "epsilonWallFunction"
+        front_nut = "empty" if is_2d else "nutkWallFunction"
+        back_nut = "empty" if is_2d else "nutkWallFunction"
+        front_alphat = "empty" if is_2d else "compressible::alphatWallFunction"
+        back_alphat = "empty" if is_2d else "compressible::alphatWallFunction"
 
+        # ── p ──────────────────────────────────────────────────────────────
+        # totalPressure without explicit gamma – uses thermo model internally.
         p_txt = f"""FoamFile
 {{
     version 2.0;
@@ -404,15 +464,17 @@ dimensions [1 -1 -2 0 0 0 0];
 internalField uniform {p_init};
 boundaryField
 {{
-    inlet {{ type totalPressure; p0 uniform {p0}; gamma 1.4; value uniform {p_init}; }}
+    inlet {{ type totalPressure; p0 uniform {p0}; value uniform {p_init}; }}
     outlet {{ type fixedValue; value uniform {pa}; }}
     upperWall {{ type zeroGradient; }}
     lowerWall {{ type zeroGradient; }}
-    front {{ type empty; }}
-    back {{ type empty; }}
+    front {{ type {front_p}; }}
+    back {{ type {back_p}; }}
 }}
 """
 
+        # ── U ──────────────────────────────────────────────────────────────
+        # pressureInletVelocity is the correct companion to totalPressure.
         u_txt = f"""FoamFile
 {{
     version 2.0;
@@ -425,15 +487,16 @@ dimensions [0 1 -1 0 0 0 0];
 internalField uniform ({u_init} 0 0);
 boundaryField
 {{
-    inlet {{ type fixedValue; value uniform ({u_in} 0 0); }}
+    inlet {{ type pressureInletVelocity; value uniform ({u_init} 0 0); }}
     outlet {{ type inletOutlet; inletValue uniform ({u_init} 0 0); value uniform ({u_init} 0 0); }}
     upperWall {{ type noSlip; }}
     lowerWall {{ type noSlip; }}
-    front {{ type empty; }}
-    back {{ type empty; }}
+    front {{ type {front_u}; }}
+    back {{ type {back_u}; }}
 }}
 """
 
+        # ── T ──────────────────────────────────────────────────────────────
         t_txt = f"""FoamFile
 {{
     version 2.0;
@@ -446,15 +509,16 @@ dimensions [0 0 0 1 0 0 0];
 internalField uniform {t_init};
 boundaryField
 {{
-    inlet {{ type totalTemperature; T0 uniform {t0}; gamma 1.4; value uniform {t0}; }}
+    inlet {{ type totalTemperature; T0 uniform {t0}; value uniform {t0}; }}
     outlet {{ type inletOutlet; inletValue uniform {t_init}; value uniform {t_init}; }}
     upperWall {{ type zeroGradient; }}
     lowerWall {{ type zeroGradient; }}
-    front {{ type empty; }}
-    back {{ type empty; }}
+    front {{ type {front_t}; }}
+    back {{ type {back_t}; }}
 }}
 """
 
+        # ── k ──────────────────────────────────────────────────────────────
         k_txt = f"""FoamFile
 {{
     version 2.0;
@@ -471,11 +535,12 @@ boundaryField
     outlet {{ type zeroGradient; }}
     upperWall {{ type kqRWallFunction; value uniform 1e-10; }}
     lowerWall {{ type kqRWallFunction; value uniform 1e-10; }}
-    front {{ type empty; }}
-    back {{ type empty; }}
+    front {{ type {front_k}; {'value uniform 1e-10;' if not is_2d else ''} }}
+    back {{ type {back_k}; {'value uniform 1e-10;' if not is_2d else ''} }}
 }}
 """
 
+        # ── epsilon ─────────────────────────────────────────────────────────
         eps_txt = f"""FoamFile
 {{
     version 2.0;
@@ -492,92 +557,54 @@ boundaryField
     outlet {{ type zeroGradient; }}
     upperWall {{ type epsilonWallFunction; value uniform 1e-10; }}
     lowerWall {{ type epsilonWallFunction; value uniform 1e-10; }}
-    front {{ type empty; }}
-    back {{ type empty; }}
+    front {{ type {front_eps}; {'value uniform 1e-10;' if not is_2d else ''} }}
+    back {{ type {back_eps}; {'value uniform 1e-10;' if not is_2d else ''} }}
 }}
 """
 
-        nut_txt = """FoamFile
-{
+        # ── nut ─────────────────────────────────────────────────────────────
+        nut_txt = f"""FoamFile
+{{
     version 2.0;
     format ascii;
     class volScalarField;
     object nut;
-}
+}}
 
 dimensions [0 2 -1 0 0 0 0];
 internalField uniform 0;
 boundaryField
-{
-    inlet { type calculated; value uniform 0; }
-    outlet { type calculated; value uniform 0; }
-    upperWall { type nutkWallFunction; value uniform 0; }
-    lowerWall { type nutkWallFunction; value uniform 0; }
-    front { type empty; }
-    back { type empty; }
-}
+{{
+    inlet {{ type calculated; value uniform 0; }}
+    outlet {{ type calculated; value uniform 0; }}
+    upperWall {{ type nutkWallFunction; value uniform 0; }}
+    lowerWall {{ type nutkWallFunction; value uniform 0; }}
+    front {{ type {front_nut}; {'value uniform 0;' if not is_2d else ''} }}
+    back {{ type {back_nut}; {'value uniform 0;' if not is_2d else ''} }}
+}}
 """
-        alphat_txt = """FoamFile
-{
+
+        # ── alphat ──────────────────────────────────────────────────────────
+        alphat_txt = f"""FoamFile
+{{
     version 2.0;
     format ascii;
     class volScalarField;
     object alphat;
-}
+}}
 
 dimensions [1 -1 -1 0 0 0 0];
 internalField uniform 0;
 boundaryField
-{
-    inlet { type calculated; value uniform 0; }
-    outlet { type calculated; value uniform 0; }
-    upperWall { type compressible::alphatWallFunction; value uniform 0; }
-    lowerWall { type compressible::alphatWallFunction; value uniform 0; }
-    front { type empty; }
-    back { type empty; }
-}
+{{
+    inlet {{ type calculated; value uniform 0; }}
+    outlet {{ type calculated; value uniform 0; }}
+    upperWall {{ type compressible::alphatWallFunction; value uniform 0; }}
+    lowerWall {{ type compressible::alphatWallFunction; value uniform 0; }}
+    front {{ type {front_alphat}; {'value uniform 0;' if not is_2d else ''} }}
+    back {{ type {back_alphat}; {'value uniform 0;' if not is_2d else ''} }}
+}}
 """
-
-        mode = str(self.solverConfig.get("dimension", "2d_planar"))
-        if mode != "2d_planar":
-            p_txt = p_txt.replace("front { type empty; }", "front { type zeroGradient; }")
-            p_txt = p_txt.replace("back { type empty; }", "back { type zeroGradient; }")
-
-            u_txt = u_txt.replace("front { type empty; }", "front { type noSlip; }")
-            u_txt = u_txt.replace("back { type empty; }", "back { type noSlip; }")
-
-            t_txt = t_txt.replace("front { type empty; }", "front { type zeroGradient; }")
-            t_txt = t_txt.replace("back { type empty; }", "back { type zeroGradient; }")
-
-            k_txt = k_txt.replace(
-                "front { type empty; }", "front { type kqRWallFunction; value uniform 1e-10; }"
-            )
-            k_txt = k_txt.replace(
-                "back { type empty; }", "back { type kqRWallFunction; value uniform 1e-10; }"
-            )
-
-            eps_txt = eps_txt.replace(
-                "front { type empty; }", "front { type epsilonWallFunction; value uniform 1e-10; }"
-            )
-            eps_txt = eps_txt.replace(
-                "back { type empty; }", "back { type epsilonWallFunction; value uniform 1e-10; }"
-            )
-
-            nut_txt = nut_txt.replace(
-                "front { type empty; }", "front { type nutkWallFunction; value uniform 0; }"
-            )
-            nut_txt = nut_txt.replace(
-                "back { type empty; }", "back { type nutkWallFunction; value uniform 0; }"
-            )
-
-            alphat_txt = alphat_txt.replace(
-                "front { type empty; }",
-                "front { type compressible::alphatWallFunction; value uniform 0; }",
-            )
-            alphat_txt = alphat_txt.replace(
-                "back { type empty; }",
-                "back { type compressible::alphatWallFunction; value uniform 0; }",
-            )
 
         (case_dir / "0" / "p").write_text(p_txt, encoding="utf-8")
         (case_dir / "0" / "U").write_text(u_txt, encoding="utf-8")
@@ -587,15 +614,79 @@ boundaryField
         (case_dir / "0" / "nut").write_text(nut_txt, encoding="utf-8")
         (case_dir / "0" / "alphat").write_text(alphat_txt, encoding="utf-8")
 
-    def _parse_last_float(self, text: str) -> float:
-        nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text)
-        if not nums:
-            raise RuntimeError(f"Unable to parse numeric value from:\n{text}")
-        return float(nums[-1])
+    def _parse_postprocessing_dat(self, dat_path: Path) -> List[float]:
+        """Parse the last data row of a surfaceFieldValue.dat into a flat float list.
 
-    def _run_post(self, case_dir: Path, func: str) -> float:
-        out = self._run_cmd(f"postProcess -latestTime -func \"{func}\"", case_dir)
-        return self._parse_last_float(out)
+        Handles scalar fields ``(time  val)`` and vector fields
+        ``(time  (Ux Uy Uz))`` by stripping parentheses.
+        Returns an empty list if the file is missing or empty.
+        """
+        if not dat_path.exists():
+            return []
+        text = dat_path.read_text(encoding="utf-8", errors="replace")
+        data_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        if not data_lines:
+            return []
+        last = data_lines[-1].replace("(", " ").replace(")", " ")
+        try:
+            return [float(v) for v in last.split()]
+        except ValueError:
+            return []
+
+    def _extract_outlet_values(self, case_dir: Path) -> "tuple[float, float, float, float]":
+        """Read averaged outlet p, mag(U), T and mass-flow from postProcessing.
+
+        Returns ``(p_out, u_out, t_out, mdot)``.
+        Raises RuntimeError if the required function-object output is absent.
+        """
+        post = case_dir / "postProcessing"
+
+        def _latest_dat(name: str) -> Path:
+            d = post / name
+            if not d.exists():
+                raise RuntimeError(
+                    f"postProcessing/{name} not found – function objects may not "
+                    f"have run. Check {case_dir / 'log.rhoSimpleFoam'} for errors."
+                )
+            time_dirs = sorted(
+                [p for p in d.iterdir() if p.is_dir()],
+                key=lambda p: float(p.name) if p.name.replace(".", "", 1).isdigit() else 0.0,
+            )
+            if not time_dirs:
+                raise RuntimeError(f"No time directories found in postProcessing/{name}")
+            return time_dirs[-1] / "surfaceFieldValue.dat"
+
+        # ── outlet scalars: [time, p, T] ──────────────────────────────────
+        sc = self._parse_postprocessing_dat(_latest_dat("outletScalars"))
+        if len(sc) < 3:
+            raise RuntimeError(f"outletScalars parse failed, got {sc}")
+        p_out = sc[1]
+        t_out = sc[2]
+
+        # ── outlet velocity: [time, Ux, Uy, Uz] ──────────────────────────
+        vel = self._parse_postprocessing_dat(_latest_dat("outletVelocity"))
+        if len(vel) < 4:
+            raise RuntimeError(f"outletVelocity parse failed, got {vel}")
+        u_out = math.sqrt(vel[1] ** 2 + vel[2] ** 2 + vel[3] ** 2)
+
+        # ── outlet mass-flow: [time, phi_sum] ─────────────────────────────
+        phi = self._parse_postprocessing_dat(_latest_dat("outletMassFlow"))
+        if len(phi) < 2:
+            raise RuntimeError(f"outletMassFlow parse failed, got {phi}")
+        mdot = abs(phi[1])
+
+        return p_out, u_out, t_out, mdot
+
+    def _check_convergence(self, case_dir: Path) -> bool:
+        """Return True if rhoSimpleFoam reached its residual convergence target."""
+        log_path = case_dir / "log.rhoSimpleFoam"
+        if not log_path.exists():
+            return False
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+        if "SIMPLE solution converged" in text:
+            return True
+        # Fallback: at minimum the run must have completed without abort.
+        return "End" in text and "FATAL" not in text
 
     def _build_case(self, case_dir: Path) -> None:
         for p in [
@@ -640,10 +731,41 @@ boundaryField
             self._lastResult = fallback
             return fallback
 
-        p_out = self._run_post(case_dir, "patchAverage(name=outlet,p)")
-        u_out = self._run_post(case_dir, "patchAverage(name=outlet,mag(U))")
-        t_out = self._run_post(case_dir, "patchAverage(name=outlet,T)")
-        mdot = abs(self._run_post(case_dir, "patchIntegrate(name=outlet,phi)"))
+        converged = self._check_convergence(case_dir)
+        if not converged:
+            msg = (
+                f"rhoSimpleFoam did not converge for case {gid}. "
+                f"Inspect {case_dir / 'log.rhoSimpleFoam'} for details."
+            )
+            if not bool(self.solverConfig.get("fallback_on_failure", False)):
+                raise RuntimeError(msg)
+            # Fallback with convergence warning attached.
+            fallback = CFDSimulation(
+                geometry=self.geometry,
+                solverConfig=self.solverConfig,
+                resultPath=self.resultPath,
+            ).extractResults()
+            fallback.metadata["backend"] = "openfoam_fallback"
+            fallback.metadata["convergence_warning"] = msg
+            fallback.metadata["case_dir"] = str(case_dir)
+            self._lastResult = fallback
+            return fallback
+
+        try:
+            p_out, u_out, t_out, mdot = self._extract_outlet_values(case_dir)
+        except Exception as exc:
+            if not bool(self.solverConfig.get("fallback_on_failure", False)):
+                raise
+            fallback = CFDSimulation(
+                geometry=self.geometry,
+                solverConfig=self.solverConfig,
+                resultPath=self.resultPath,
+            ).extractResults()
+            fallback.metadata["backend"] = "openfoam_fallback"
+            fallback.metadata["postprocess_error"] = str(exc)
+            fallback.metadata["case_dir"] = str(case_dir)
+            self._lastResult = fallback
+            return fallback
 
         gamma = float(self.solverConfig.get("gamma", 1.4))
         r = float(self.solverConfig.get("gas_constant", 287.0))
@@ -655,13 +777,18 @@ boundaryField
         p0_out = p_out * (1.0 + 0.5 * (gamma - 1.0) * m_out * m_out) ** (gamma / (gamma - 1.0))
         pressure_loss = max(0.0, min(0.999, 1.0 - p0_out / p0))
 
+        dimension = str(self.solverConfig.get("dimension", "2d_planar"))
         depth = float(self.solverConfig.get("depth", 0.02))
-        a_exit = 2.0 * self.geometry.exit_radius * depth
+        if dimension in ("2d_planar", "3d_channel"):
+            a_exit = 2.0 * self.geometry.exit_radius * depth
+        else:
+            a_exit = math.pi * self.geometry.exit_radius ** 2
         thrust = mdot * u_out + (p_out - pa) * a_exit
 
         n = int(self.solverConfig.get("n_samples", 60))
+        t0_cfg = float(self.solverConfig.get("stagnation_temperature", 1000.0))
         mach_profile = [1.0 + (m_out - 1.0) * i / max(n - 1, 1) for i in range(n)]
-        temp_profile = [float(self.solverConfig.get("stagnation_temperature", 1000.0)) / (1.0 + 0.5 * (gamma - 1.0) * m * m) for m in mach_profile]
+        temp_profile = [t0_cfg / (1.0 + 0.5 * (gamma - 1.0) * m * m) for m in mach_profile]
         pressure_profile = [p0 / (1.0 + 0.5 * (gamma - 1.0) * m * m) ** (gamma / (gamma - 1.0)) for m in mach_profile]
 
         self._lastResult = EvaluationResult(
@@ -673,7 +800,8 @@ boundaryField
             pressureProfile=pressure_profile,
             metadata={
                 "backend": "openfoam_rans",
-                "dimension": str(self.solverConfig.get("dimension", "2d_planar")),
+                "converged": converged,
+                "dimension": dimension,
                 "case_dir": str(case_dir),
                 "outlet_pressure": p_out,
                 "outlet_velocity": u_out,
@@ -690,5 +818,5 @@ boundaryField
         return self._lastResult.thrust
 
     def plotFields(self, savepath: str | None = None) -> None:
-        # For RANS backend, field plotting should be done with ParaView/OpenFOAM tools.
+        # For RANS backend, field plotting is done with ParaView/OpenFOAM post-processing.
         return None

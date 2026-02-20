@@ -143,20 +143,27 @@ def generate_comparison_plots(
         plt.savefig(out / "compare_temperature.png", dpi=180)
         plt.close()
 
-    # 6) Performance bars
-    labels = ["Thrust [N]", "Pressure loss [-]"]
-    moc_vals = [moc_result.thrust, moc_result.pressureLoss]
-    opt_vals = [optimized_result.thrust, optimized_result.pressureLoss]
+    # 6) Performance comparison — two separate sub-plots (different units/scales).
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4))
 
-    x = [0, 1]
-    w = 0.35
-    plt.figure(figsize=(7, 4))
-    plt.bar([i - w / 2 for i in x], moc_vals, width=w, label="MOC", color="tab:blue")
-    plt.bar([i + w / 2 for i in x], opt_vals, width=w, label="OPT", color="tab:orange")
-    plt.xticks(x, labels)
-    plt.title("Performance Comparison")
-    plt.grid(True, axis="y", alpha=0.3)
-    _legend_unique()
+    ax_thrust, ax_loss = axes
+    bar_colors = ["tab:blue", "tab:orange"]
+
+    ax_thrust.bar(["MOC", "OPT"], [moc_result.thrust, optimized_result.thrust], color=bar_colors)
+    ax_thrust.set_ylabel("Thrust [N]")
+    ax_thrust.set_title("Thrust")
+    ax_thrust.grid(True, axis="y", alpha=0.3)
+    for bar_x, val in zip(["MOC", "OPT"], [moc_result.thrust, optimized_result.thrust]):
+        ax_thrust.text(bar_x, val * 1.01, f"{val:.2f}", ha="center", va="bottom", fontsize=8)
+
+    ax_loss.bar(["MOC", "OPT"], [moc_result.pressureLoss, optimized_result.pressureLoss], color=bar_colors)
+    ax_loss.set_ylabel("Pressure loss [-]  (lower is better)")
+    ax_loss.set_title("Pressure Loss")
+    ax_loss.grid(True, axis="y", alpha=0.3)
+    for bar_x, val in zip(["MOC", "OPT"], [moc_result.pressureLoss, optimized_result.pressureLoss]):
+        ax_loss.text(bar_x, val * 1.01, f"{val:.4f}", ha="center", va="bottom", fontsize=8)
+
+    fig.suptitle("Performance Comparison")
     plt.tight_layout()
     plt.savefig(out / "compare_performance.png", dpi=180)
     plt.close()

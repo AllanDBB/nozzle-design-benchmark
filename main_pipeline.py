@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import sys
+import threading
 from pathlib import Path
 from typing import Dict, Any
 
@@ -10,6 +13,25 @@ from benchmarks import BenchmarkSuite
 from evaluators import CFDSimulation, OpenFOAMRANSEvaluator, EvaluationResult
 from geometry import MOCSolver, NozzleGeometry
 from optimization import Optimizer, OptimizationRunner
+
+
+# ---------------------------------------------------------------------------
+# Import run_multiobjective from scripts/ (no __init__.py there)
+# ---------------------------------------------------------------------------
+def _import_multiobjective():
+    spec = importlib.util.spec_from_file_location(
+        "multiobjective_rank",
+        Path(__file__).parent / "scripts" / "multiobjective_rank.py",
+    )
+    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod.run_multiobjective
+
+
+try:
+    _run_multiobjective = _import_multiobjective()
+except Exception:
+    _run_multiobjective = None  # type: ignore[assignment]
 
 
 def default_config() -> Dict[str, Any]:
@@ -55,6 +77,8 @@ def default_config() -> Dict[str, Any]:
             "p_initial": 5.4e5,
             "u_initial": 1.0,
             "t_initial": 1000.0,
+            # GPU acceleration for quasi-1D solver (requires CuPy).
+            "use_gpu": False,
         },
         "optimization": {
             "algorithm": "random",
@@ -67,6 +91,13 @@ def default_config() -> Dict[str, Any]:
             "n_samples": 3,
             "n_points": 180,
             "profile": "bezier_like",
+            # Multi-objective weights (thrust maximised, loss minimised).
+            "w_thrust": 1.0,
+            "w_pressure_loss": 0.0,
+            # Set to true to use Pareto-knee candidate instead of best-score.
+            "use_pareto_knee": False,
+            # Parallel workers for population evaluation (1 = sequential).
+            "n_workers": 1,
         },
     }
 
@@ -106,6 +137,13 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     # 2) Optimize parametrized geometry using CFD-like evaluator.
     eval_cfg = dict(config["evaluator"])
     opt_cfg = config["optimization"]
+    require_rans = bool(eval_cfg.get("require_rans_converged", False))
+
+    if require_rans and str(eval_cfg.get("backend", "openfoam")).lower() != "openfoam":
+        raise ValueError("require_rans_converged=true requires evaluator.backend='openfoam'")
+
+    def is_rans_converged(result: EvaluationResult) -> bool:
+        return str(result.metadata.get("backend", "")).lower() == "openfoam_rans"
 
     def make_evaluator(geometry: NozzleGeometry):
         backend = str(eval_cfg.get("backend", "quasi1d")).lower()
@@ -118,13 +156,29 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     n_points = int(opt_cfg.get("n_points", 180))
     profile = str(opt_cfg.get("profile", "bezier_like"))
 
+    # Thread-safe counter so parallel workers get unique IDs.
+    _gid_counter = 0
+    _gid_lock = threading.Lock()
+
+    def _next_gid() -> str:
+        nonlocal _gid_counter
+        with _gid_lock:
+            idx = _gid_counter
+            _gid_counter += 1
+        return f"opt_candidate_{idx:04d}"
+
     def objective(param_dict: Dict[str, float]):
-        gid = f"opt_candidate_{len(optimizer._history):04d}"
+        gid = _next_gid()
         geom = build_geometry_from_params(param_dict, throat, n_points, profile, gid)
-        evaluator.geometry = geom
+        # Create a fresh evaluator per call so parallel workers don't share state.
+        local_eval = make_evaluator(geom)
         try:
-            result = evaluator.extractResults()
+            result = local_eval.extractResults()
             result.geometryId = gid
+            if require_rans and not is_rans_converged(result):
+                raise RuntimeError(
+                    f"Candidate {gid} not RANS-converged (backend={result.metadata.get('backend', 'unknown')})"
+                )
             return result
         except Exception as exc:
             # Penalize failed CFD candidates so optimization can continue.
@@ -137,7 +191,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
             )
 
     optimizer = Optimizer(
-        searchSpace={k: v for k, v in opt_cfg.items() if k != "algorithm" and k != "seed"},
+        searchSpace={k: v for k, v in opt_cfg.items() if k not in ("algorithm", "seed")},
         objectiveFunc=objective,
         algorithm=str(opt_cfg.get("algorithm", "ga")),
         seed=int(opt_cfg.get("seed", 42)),
@@ -146,10 +200,43 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     runner.start()
     runner.saveHistory()
 
-    best_params = dict(runner.bestResult.metadata.get("best_params", {})) if runner.bestResult else {}
-    if not best_params:
-        idx = max(range(len(optimizer._history)), key=lambda i: optimizer._history[i].thrust)
-        best_params = optimizer._history_params[idx]
+    # ── Multi-objective ranking (Pareto analysis on full history) ──────────
+    mo_summary: Dict[str, Any] = {}
+    if _run_multiobjective is not None and len(optimizer._history) > 1:
+        history_records = []
+        for r, p in zip(optimizer._history, optimizer._history_params):
+            rec = r.to_dict()
+            rec["params"] = dict(p)
+            history_records.append(rec)
+        try:
+            mo_summary = _run_multiobjective(
+                records=history_records,
+                out_dir=str(out_dir / "multiobjective"),
+                w_thrust=float(opt_cfg.get("w_thrust", 0.7)),
+                w_pressure_loss=float(opt_cfg.get("w_pressure_loss", 0.3)),
+            )
+        except Exception as _exc:
+            mo_summary = {"error": str(_exc)}
+
+    # ── Select best candidate ──────────────────────────────────────────────
+    selected_idx: int
+    use_pareto_knee = bool(opt_cfg.get("use_pareto_knee", False))
+    if require_rans:
+        valid_idxs = [i for i, r in enumerate(optimizer._history) if is_rans_converged(r)]
+        if not valid_idxs:
+            raise RuntimeError(
+                "No RANS-converged candidates found. "
+                "All evaluations failed to converge in OpenFOAM (or fell back)."
+            )
+        selected_idx = max(valid_idxs, key=lambda i: optimizer._objective_score(optimizer._history[i]))
+    elif use_pareto_knee and mo_summary and "best_pareto_knee" in mo_summary:
+        knee_idx = int(mo_summary["best_pareto_knee"].get("candidate_index", -1))
+        selected_idx = knee_idx if 0 <= knee_idx < len(optimizer._history) else optimizer._best_idx()
+    else:
+        selected_idx = optimizer._best_idx()
+
+    best_params = optimizer._history_params[selected_idx]
+
 
     optimized_geometry = build_geometry_from_params(best_params, throat, n_points, profile, "optimized_best")
     optimized_geometry.exportGeo(str(out_dir / "optimized_geometry.csv"))
@@ -162,11 +249,19 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     benchmark_error = ""
     try:
         suite.runAll()
+        if require_rans:
+            if suite.mocResult is None or suite.optResult is None:
+                raise RuntimeError("Benchmark results missing.")
+            if not is_rans_converged(suite.mocResult):
+                raise RuntimeError("MOC benchmark is not RANS-converged.")
+            if not is_rans_converged(suite.optResult):
+                raise RuntimeError("Optimized benchmark is not RANS-converged.")
         comparison = suite.save(str(out_dir))
         generate_optimization_plots(
             history=optimizer._history,
             out_dir=str(out_dir),
             moc_thrust=suite.mocResult.thrust if suite.mocResult is not None else None,
+            moc_pressure_loss=suite.mocResult.pressureLoss if suite.mocResult is not None else None,
             population=int(opt_cfg.get("population", 0)) if str(opt_cfg.get("algorithm", "")).lower() in {"ga", "cma-es", "evolutionary"} else None,
             moc_geometry=moc_geometry,
             throat_radius=throat,
@@ -213,6 +308,9 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     note.addMetric("optimizer_algorithm", optimizer.algorithm)
     note.addMetric("optimizer_evaluations", len(optimizer._history))
     note.addMetric("best_parameters", best_params)
+    note.addMetric("selected_candidate_index", selected_idx)
+    if mo_summary:
+        note.addMetric("multiobjective_summary", mo_summary)
 
     note.save(str(out_dir / "report.md"))
     note.saveJSON(str(out_dir / "report.json"))
@@ -223,6 +321,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         "moc_geometry": str(out_dir / "moc_geometry.csv"),
         "optimized_geometry": str(out_dir / "optimized_geometry.csv"),
         "comparison": comparison,
+        "multiobjective": mo_summary,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary

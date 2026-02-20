@@ -1,8 +1,10 @@
 {
-  "out_dir": "out/test_rans_2d",
+  "_comment": "Quick 2-D OpenFOAM test. Requires Docker + OpenFOAM 13 image. ~15-40 min per candidate.",
+  "out_dir": "out/rans_2d_quick",
   "moc": {
     "mach_exit": 2.3,
     "pressure_ratio": 0.10,
+    "gamma": 1.4,
     "geometry": {
       "throat_y": 0.02,
       "exit_y": 0.06,
@@ -17,18 +19,28 @@
     "depth": 0.02,
     "mesh_nx": 80,
     "mesh_ny": 36,
-    "end_time": 400,
+    "end_time": 500,
     "write_interval": 100,
     "gamma": 1.4,
     "stagnation_temperature": 900.0,
     "stagnation_pressure": 300000.0,
     "ambient_pressure": 90000.0,
+    "n_samples": 80,
+    "friction_scale": 0.2,
+    "cf_multiplier": 1.0,
+    "curvature_scale": 0.05,
+    "bl_displacement_scale": 1.0,
+    "discharge_coefficient": 0.985,
+    "enable_shock_model": true,
+    "shock_trigger_ratio": 0.55,
+    "divergence_scale": 1.0,
     "inlet_velocity": 10.0,
     "k_inlet": 0.5,
     "epsilon_inlet": 10.0,
     "p_initial": 270000.0,
     "u_initial": 1.0,
-    "t_initial": 900.0
+    "t_initial": 900.0,
+    "use_gpu": false
   },
   "optimization": {
     "algorithm": "random",
@@ -38,8 +50,12 @@
       "length": [0.20, 0.26],
       "shape": [1.5, 2.0]
     },
-    "n_samples": 1,
+    "n_samples": 3,
     "n_points": 120,
-    "profile": "bezier_like"
+    "profile": "bezier_like",
+    "w_thrust": 1.0,
+    "w_pressure_loss": 0.0,
+    "use_pareto_knee": false,
+    "n_workers": 1
   }
 }
