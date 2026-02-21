@@ -181,60 +181,66 @@ wallDist
         (case_dir / "system" / "fvSchemes").write_text(txt, encoding="utf-8")
 
     def _write_fv_solution(self, case_dir: Path) -> None:
-        txt = """FoamFile
-{
+        pa = float(self.solverConfig.get("ambient_pressure", 1.0e5))
+        txt = f"""FoamFile
+{{
     version 2.0;
     format ascii;
     class dictionary;
     object fvSolution;
-}
+}}
 
 solvers
-{
+{{
     p
-    {
+    {{
         solver          GAMG;
-        smoother        DIC;
+        smoother        GaussSeidel;
         tolerance       1e-8;
         relTol          0.01;
-    }
+    }}
 
     "(U|h|k|epsilon)"
-    {
+    {{
         solver          PBiCGStab;
         preconditioner  DILU;
         tolerance       1e-10;
         relTol          0.1;
-    }
-}
+    }}
+}}
 
 PIMPLE
-{
+{{
+    // pRefCell/pRefValue anchor the absolute pressure level so that
+    // a zeroGradient supersonic outlet does not leave the matrix singular.
+    pRefCell    0;
+    pRefValue   {pa};
+
     residualControl
-    {
+    {{
         p               1e-4;
         U               1e-5;
         "(h|k|epsilon)" 1e-5;
-    }
+    }}
 
-    nNonOrthogonalCorrectors 1;
-}
+    nNonOrthogonalCorrectors 2;
+}}
 
 relaxationFactors
-{
+{{
     fields
-    {
-        p       0.3;
-        rho     0.01;
-    }
+    {{
+        p       0.2;
+        rho     0.05;
+    }}
     equations
-    {
-        U       0.4;
-        h       0.2;
-        k       0.3;
-        epsilon 0.3;
-    }
-}
+    {{
+        U       0.3;
+        h       0.15;
+        k       0.2;
+        epsilon 0.2;
+    }}
+}}
 """
         (case_dir / "system" / "fvSolution").write_text(txt, encoding="utf-8")
 
@@ -519,7 +525,7 @@ internalField uniform {p_init};
 boundaryField
 {{
     inlet {{ type totalPressure; p0 uniform {p0}; gamma 1.4; value uniform {p_init}; }}
-    outlet {{ type fixedValue; value uniform {pa}; }}
+    outlet {{ type zeroGradient; }}
     upperWall {{ type zeroGradient; }}
     lowerWall {{ type zeroGradient; }}
     front {{ type {front_p}; }}
