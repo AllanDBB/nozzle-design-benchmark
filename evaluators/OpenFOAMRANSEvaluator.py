@@ -192,10 +192,10 @@ wallDist
 
 solvers
 {
-    p
+    "(p|phid)"
     {
-        solver          GAMG;
-        smoother        DIC;
+        solver          PBiCGStab;
+        preconditioner  DILU;
         tolerance       1e-8;
         relTol          0.01;
     }
