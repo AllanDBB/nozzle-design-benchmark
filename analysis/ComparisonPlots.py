@@ -264,13 +264,13 @@ def generate_comparison_plots(
     _dl_pct = abs(optimized_result.pressureLoss - moc_result.pressureLoss) / max(abs(moc_result.pressureLoss), 1e-9) * 100
 
     if _thrust_winner == _loss_winner:
-        _trophy = f"\U0001f3c6  {_thrust_winner} wins both metrics"
+        _trophy = f"[WINNER] {_thrust_winner} wins both metrics"
         _verdict_color = "darkgreen"
     elif _thrust_winner == "OPT":
-        _trophy = f"\u2696  Tradeoff — OPT thrust \u25b2, MOC loss \u25bc"
+        _trophy = "[TRADEOFF] OPT thrust higher, MOC pressure loss lower"
         _verdict_color = "darkorange"
     else:
-        _trophy = f"\u2696  Tradeoff — MOC thrust \u25b2, OPT loss \u25bc"
+        _trophy = "[TRADEOFF] MOC thrust higher, OPT pressure loss lower"
         _verdict_color = "darkorange"
 
     fig, axes = plt.subplots(1, 2, figsize=(9, 4.8))

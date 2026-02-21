@@ -475,41 +475,18 @@ mergePatchPairs();
         t_init = float(self.solverConfig.get("t_initial", t0))
         gamma_cf = float(self.solverConfig.get("gamma", 1.4))
 
-        # Guard: if u_initial is unrealistically low (< 50 m/s), compute the IC
-        # on the SUPERSONIC branch so SIMPLE converges toward the supersonic
-        # solution instead of the subsonic one.
-        #
-        # Strategy: binary-search for M_ss where isentropic p/p0 == pa/p0
-        # (the supersonic root, M > 1), then initialise at ~85 % of that Mach.
-        # With u_init >> speed-of-sound SIMPLE starts on the right branch.
+        # Guard: if u_initial is unrealistically low (< 50 m/s), compute
+        # a sane M=0.3 isentropic state from stagnation conditions.
+        # A uniform supersonic IC causes the first GAMG pressure correction
+        # to overflow because of the large velocity divergence in the duct.
         import math as _math
         _R = 287.0
         if u_init < 50.0:
-            _pr = pa / max(p0, 1e-9)
-
-            def _iso_p(M: float) -> float:
-                return (1.0 + (gamma_cf - 1.0) / 2.0 * M * M) ** (
-                    -gamma_cf / (gamma_cf - 1.0)
-                )
-
-            # Supersonic root only exists when pa/p0 < critical pressure ratio.
-            if 0.0 < _pr < _iso_p(1.001):
-                _lo, _hi = 1.001, 10.0
-                for _ in range(60):
-                    _mid = 0.5 * (_lo + _hi)
-                    if _iso_p(_mid) > _pr:
-                        _lo = _mid
-                    else:
-                        _hi = _mid
-                _M_ss = 0.5 * (_lo + _hi)
-            else:
-                _M_ss = 1.5  # fallback if nozzle is not choked
-
-            _M_ic = max(1.05, _M_ss * 0.85)  # 85 % of supersonic design Mach
-            _fac = 1.0 + (gamma_cf - 1.0) / 2.0 * _M_ic ** 2
+            _M0 = 0.3
+            _fac = 1.0 + (gamma_cf - 1.0) / 2.0 * _M0 ** 2
             t_init = t0 / _fac
             p_init = p0 / _fac ** (gamma_cf / (gamma_cf - 1.0))
-            u_init = _M_ic * _math.sqrt(gamma_cf * _R * t_init)
+            u_init = _M0 * _math.sqrt(gamma_cf * _R * t_init)
         mode = str(self.solverConfig.get("dimension", "2d_planar"))
         is_2d = mode == "2d_planar"
         front_p = "empty" if is_2d else "zeroGradient"
