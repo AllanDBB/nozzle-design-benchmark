@@ -306,6 +306,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
             profile=profile,
             gamma=float(eval_cfg.get("gamma", 1.4)),
             gas_constant=float(eval_cfg.get("gas_constant", 287.0)),
+            mach_exit=float(moc_cfg.get("mach_exit", 2.0)),
         )
         if suite.mocResult is not None and suite.optResult is not None:
             generate_comparison_plots(
@@ -315,6 +316,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
                 optimized_result=suite.optResult,
                 out_dir=str(comp_dir),
                 solver_config=eval_cfg,
+                mach_exit=float(moc_cfg.get("mach_exit", 2.0)),
             )
 
         bench_eval.geometry = moc_geometry

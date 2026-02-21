@@ -2,10 +2,67 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Iterable, Optional, List
+import math
 
 import matplotlib.pyplot as plt
 
 from geometry import NozzleGeometry
+
+
+def _draw_char_lines(
+    ax: Any,
+    geometry: NozzleGeometry,
+    mach_exit: float,
+    gamma: float = 1.4,
+    n_lines: int = 14,
+    alpha: float = 0.25,
+    color: str = "tab:blue",
+) -> None:
+    """Overlay MOC-style C+ right-running characteristics on *ax*."""
+    x_end = geometry.length
+    throat = geometry.throat_radius
+    n_steps = max(n_lines * 14, 200)
+    xs_fine = [i * x_end / n_steps for i in range(n_steps + 1)]
+
+    def _mach_sup(area_ratio: float) -> float:
+        if area_ratio <= 1.0:
+            return 1.0
+        lo, hi = 1.0, 20.0
+        for _ in range(50):
+            mid = 0.5 * (lo + hi)
+            fac = 1.0 + (gamma - 1.0) / 2.0 * mid * mid
+            ar = ((2.0 / (gamma + 1.0)) * fac) ** ((gamma + 1.0) / (2.0 * (gamma - 1.0))) / mid
+            if ar > area_ratio:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    for j in range(n_lines):
+        x0 = j * x_end / max(n_lines - 1, 1)
+        y0 = 0.0
+        yw0 = geometry.y_at(x0)
+        ar0 = (yw0 / max(throat, 1e-9)) ** 2
+        m0 = _mach_sup(max(ar0, 1.0))
+        mu0 = math.asin(min(1.0, 1.0 / max(m0, 1.001)))
+        dyw = (geometry.y_at(min(x0 + 1e-4, x_end)) - geometry.y_at(max(x0 - 1e-4, 0.0))) / 2e-4
+        theta0 = math.atan(max(dyw, 0.0))
+        slope = math.tan(theta0 + mu0)
+        rx: List[float] = [x0]
+        ry: List[float] = [y0]
+        for x in xs_fine:
+            if x <= x0:
+                continue
+            y = y0 + slope * (x - x0)
+            yw = geometry.y_at(x)
+            if y >= yw:
+                rx.append(x)
+                ry.append(yw)
+                break
+            rx.append(x)
+            ry.append(y)
+        if len(rx) > 1:
+            ax.plot(rx, ry, color=color, alpha=alpha, linewidth=0.75, zorder=2)
 
 
 def _get_field(record: Any, name: str, default: Any = None) -> Any:
@@ -42,6 +99,7 @@ def generate_optimization_plots(
     profile: str = "bezier_like",
     gamma: float = 1.4,
     gas_constant: float = 287.0,
+    mach_exit: float = 2.0,
 ) -> None:
     records = list(history)
     if not records:
@@ -197,11 +255,13 @@ def generate_optimization_plots(
 
     can_plot_geometry = throat_radius is not None
     if can_plot_geometry:
-        plt.figure(figsize=(9, 4.5))
+        fig_geom, ax_geom = plt.subplots(figsize=(9, 4.5))
         if moc_geometry is not None:
             xm = [p[0] for p in moc_geometry.control_points]
             ym = [p[1] for p in moc_geometry.control_points]
-            plt.plot(xm, ym, color="black", linewidth=2.0, label="MOC")
+            _draw_char_lines(ax_geom, moc_geometry, mach_exit, gamma,
+                             n_lines=12, alpha=0.18, color="black")
+            ax_geom.plot(xm, ym, color="black", linewidth=2.0, label="MOC", zorder=5)
         for m in milestones:
             idx = best_idx_so_far[m]
             params = _get_field(records[idx], "params", {})
@@ -221,13 +281,20 @@ def generate_optimization_plots(
             )
             xg = [p[0] for p in geom.control_points]
             yg = [p[1] for p in geom.control_points]
-            plt.plot(xg, yg, linewidth=1.6, label=f"best@{m+1} (cand {idx+1})")
-        plt.xlabel("x [m]")
-        plt.ylabel("y [m]")
-        plt.title("Best-so-Far Geometry Evolution")
-        plt.grid(True, alpha=0.25)
-        _legend_unique()
-        plt.axis("equal")
+            _lbl = f"best@{m+1} (cand {idx+1})"
+            _draw_char_lines(ax_geom, geom, mach_exit, gamma,
+                             n_lines=10, alpha=0.15)
+            ax_geom.plot(xg, yg, linewidth=1.6, label=_lbl, zorder=5)
+        ax_geom.set_xlabel("x [m]")
+        ax_geom.set_ylabel("y [m]")
+        ax_geom.set_title("Best-so-Far Geometry Evolution + Char. Lines")
+        ax_geom.grid(True, alpha=0.25)
+        handles_gg, labels_gg = ax_geom.get_legend_handles_labels()
+        seen_gg: set = set()
+        _hh = [h for h, l in zip(handles_gg, labels_gg) if not (l in seen_gg or seen_gg.add(l))]  # type: ignore
+        _ll = list(dict.fromkeys(labels_gg))
+        ax_geom.legend(_hh, _ll)
+        ax_geom.axis("equal")
         plt.tight_layout()
         plt.savefig(out / "optimization_best_so_far_geometry.png", dpi=180)
         plt.close()
