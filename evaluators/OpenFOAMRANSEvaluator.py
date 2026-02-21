@@ -60,7 +60,7 @@ class OpenFOAMRANSEvaluator:
     object controlDict;
 }}
 
-application     rhoSimpleFoam;
+application     foamRun;
 startFrom       startTime;
 startTime       0;
 stopAt          endTime;
@@ -82,11 +82,10 @@ functions
     outletScalars
     {{
         type            surfaceFieldValue;
-        libs            (fieldFunctionObjects);
+        libs            ("libfieldFunctionObjects.so");
         writeControl    writeTime;
         surfaceFormat   none;
-        regionType      patch;
-        name            outlet;
+        patch           outlet;
         operation       areaAverage;
         fields          (p T);
         writeFields     false;
@@ -95,11 +94,10 @@ functions
     outletVelocity
     {{
         type            surfaceFieldValue;
-        libs            (fieldFunctionObjects);
+        libs            ("libfieldFunctionObjects.so");
         writeControl    writeTime;
         surfaceFormat   none;
-        regionType      patch;
-        name            outlet;
+        patch           outlet;
         operation       areaAverage;
         fields          (U);
         writeFields     false;
@@ -108,11 +106,10 @@ functions
     outletMassFlow
     {{
         type            surfaceFieldValue;
-        libs            (fieldFunctionObjects);
+        libs            ("libfieldFunctionObjects.so");
         writeControl    writeTime;
         surfaceFormat   none;
-        regionType      patch;
-        name            outlet;
+        patch           outlet;
         operation       sum;
         fields          (phi);
         writeFields     false;
@@ -137,22 +134,27 @@ ddtSchemes
 
 gradSchemes
 {
-    default cellLimited Gauss linear 1;
+    default         Gauss linear;
+    limited         cellLimited Gauss linear 1;
+    grad(U)         $limited;
+    grad(k)         $limited;
+    grad(epsilon)   $limited;
 }
 
 divSchemes
 {
-    default none;
+    default         none;
+
     div(phi,U)      bounded Gauss upwind;
-    div(phi,(p|rho)) Gauss upwind;
-    div(phi,p)      Gauss upwind;
-    div(phi,rho)    Gauss upwind;
-    div(phid,p)     Gauss upwind;
-    div(phi,e)      bounded Gauss upwind;
-    div(phi,h)      Gauss upwind;
-    div(phi,K)      Gauss upwind;
-    div(phi,epsilon)  bounded Gauss upwind;
-    div(phi,k)      bounded Gauss upwind;
+
+    energy          bounded Gauss upwind;
+    div(phi,h)      $energy;
+    div(phi,K)      $energy;
+
+    turbulence      bounded Gauss upwind;
+    div(phi,k)      $turbulence;
+    div(phi,epsilon) $turbulence;
+
     div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;
 }
 
@@ -191,48 +193,86 @@ solvers
 {
     p
     {
-        solver smoothSolver;
-        smoother symGaussSeidel;
-        tolerance 1e-7;
-        relTol 0.01;
+        solver          GAMG;
+        smoother        DIC;
+        tolerance       1e-8;
+        relTol          0.01;
     }
 
-    "(U|e|k|epsilon)"
+    "(U|h|k|epsilon)"
     {
-        solver smoothSolver;
-        smoother symGaussSeidel;
-        tolerance 1e-7;
-        relTol 0.01;
+        solver          PBiCGStab;
+        preconditioner  DILU;
+        tolerance       1e-10;
+        relTol          0.1;
     }
 }
 
-SIMPLE
+PIMPLE
 {
-    nNonOrthogonalCorrectors 0;
     residualControl
     {
-        p 1e-4;
-        U 1e-5;
-        "(k|epsilon|e)" 1e-5;
+        p               1e-4;
+        U               1e-5;
+        "(h|k|epsilon)" 1e-5;
     }
+
+    nNonOrthogonalCorrectors 1;
 }
 
 relaxationFactors
 {
     fields
     {
-        p 0.12;
+        p       0.3;
+        rho     0.01;
     }
     equations
     {
-        U 0.2;
-        e 0.2;
-        k 0.2;
-        epsilon 0.2;
+        U       0.4;
+        h       0.2;
+        k       0.3;
+        epsilon 0.3;
     }
 }
 """
         (case_dir / "system" / "fvSolution").write_text(txt, encoding="utf-8")
+
+        # OF13: pressure and temperature bounds in fvConstraints
+        fc_txt = """FoamFile
+{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object fvConstraints;
+}
+
+limitp
+{
+    type    limitPressure;
+    min     100;
+    max     1e8;
+}
+
+limitT
+{
+    type        limitTemperature;
+    cellZone    all;
+    min         50;
+    max         8000;
+}
+"""
+        (case_dir / "system" / "fvConstraints").write_text(fc_txt, encoding="utf-8")
+
+        fm_txt = """FoamFile
+{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object fvModels;
+}
+"""
+        (case_dir / "system" / "fvModels").write_text(fm_txt, encoding="utf-8")
 
     def _write_thermo(self, case_dir: Path) -> None:
         txt = """FoamFile
@@ -247,11 +287,11 @@ thermoType
 {
     type            hePsiThermo;
     mixture         pureMixture;
-    transport       sutherland;
+    transport       const;
     thermo          hConst;
     equationOfState perfectGas;
     specie          specie;
-    energy          sensibleInternalEnergy;
+    energy          sensibleEnthalpy;
 }
 
 mixture
@@ -263,12 +303,12 @@ mixture
     thermodynamics
     {
         Cp          1004.5;
-        Hf          0;
+        hf          0;
     }
     transport
     {
-        As          1.4792e-06;
-        Ts          116;
+        mu          3.5e-05;
+        Pr          0.72;
     }
 }
 """
@@ -433,6 +473,19 @@ mergePatchPairs();
         p_init = float(self.solverConfig.get("p_initial", 0.9 * p0))
         u_init = float(self.solverConfig.get("u_initial", 1.0))
         t_init = float(self.solverConfig.get("t_initial", t0))
+        gamma_cf = float(self.solverConfig.get("gamma", 1.4))
+
+        # Guard: initialising from near-zero velocity causes immediate divergence
+        # for compressible high-speed flow.  If u_initial is unrealistically low
+        # (< 50 m/s) compute a sane M≈0.3 isentropic state from stagnation conds.
+        import math as _math
+        _R = 287.0
+        if u_init < 50.0:
+            _M0 = 0.3
+            _fac = 1.0 + (gamma_cf - 1.0) / 2.0 * _M0 ** 2
+            t_init = t0 / _fac
+            p_init = p0 / _fac ** (gamma_cf / (gamma_cf - 1.0))
+            u_init = _M0 * _math.sqrt(gamma_cf * _R * t_init)
         mode = str(self.solverConfig.get("dimension", "2d_planar"))
         is_2d = mode == "2d_planar"
         front_p = "empty" if is_2d else "zeroGradient"
@@ -464,7 +517,7 @@ dimensions [1 -1 -2 0 0 0 0];
 internalField uniform {p_init};
 boundaryField
 {{
-    inlet {{ type totalPressure; p0 uniform {p0}; value uniform {p_init}; }}
+    inlet {{ type totalPressure; p0 uniform {p0}; gamma 1.4; value uniform {p_init}; }}
     outlet {{ type fixedValue; value uniform {pa}; }}
     upperWall {{ type zeroGradient; }}
     lowerWall {{ type zeroGradient; }}
@@ -509,7 +562,7 @@ dimensions [0 0 0 1 0 0 0];
 internalField uniform {t_init};
 boundaryField
 {{
-    inlet {{ type totalTemperature; T0 uniform {t0}; value uniform {t0}; }}
+    inlet {{ type fixedValue; value uniform {t0}; }}
     outlet {{ type inletOutlet; inletValue uniform {t_init}; value uniform {t_init}; }}
     upperWall {{ type zeroGradient; }}
     lowerWall {{ type zeroGradient; }}
@@ -714,9 +767,9 @@ boundaryField
         self._build_case(case_dir)
 
         try:
-            self._run_cmd("blockMesh > log.blockMesh", case_dir)
-            self._run_cmd("checkMesh > log.checkMesh", case_dir)
-            self._run_cmd("rhoSimpleFoam > log.rhoSimpleFoam", case_dir)
+            self._run_cmd("blockMesh > log.blockMesh 2>&1", case_dir)
+            self._run_cmd("checkMesh > log.checkMesh 2>&1", case_dir)
+            self._run_cmd("foamRun -solver fluid > log.rhoSimpleFoam 2>&1", case_dir)
         except Exception as exc:
             if not bool(self.solverConfig.get("fallback_on_failure", False)):
                 raise
