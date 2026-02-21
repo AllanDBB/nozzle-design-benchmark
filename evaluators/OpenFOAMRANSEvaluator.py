@@ -146,6 +146,7 @@ divSchemes
     default         none;
 
     div(phi,U)      bounded Gauss upwind;
+    div(phid,p)     Gauss upwind;
 
     energy          bounded Gauss upwind;
     div(phi,h)      $energy;
@@ -210,6 +211,8 @@ solvers
 
 PIMPLE
 {
+    transonic       yes;
+
     residualControl
     {
         p               1e-4;
