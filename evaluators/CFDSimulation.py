@@ -276,10 +276,13 @@ class CFDSimulation:
         mach_exit: float = mach_profile[-1]
         p_exit: float = pressure_profile[-1]
         pt_exit: float = pt_profile_list[-1]
+        t_exit: float = temp_profile[-1]
 
         # ------------------------------------------------------------------ #
         #  Optional overexpanded-jet shock correction                         #
         # ------------------------------------------------------------------ #
+        # Shock correction modifies the SCALAR exit quantities only.
+        # Profiles are left untouched so plots stay smooth (no exit spike).
         shock_applied = False
         if shock_model and mach_exit > 1.2 and p_exit < shock_trigger_ratio * pa:
             shock_applied = True
@@ -292,16 +295,6 @@ class CFDSimulation:
         t_exit = t0 / (1.0 + 0.5 * (gamma - 1.0) * mach_exit * mach_exit)
         a_exit_sound = math.sqrt(gamma * r * max(t_exit, 1e-6))
         v_exit = mach_exit * a_exit_sound
-
-        # Keep profiles consistent with post-shock exit state.
-        if mach_profile:
-            mach_profile[-1] = mach_exit
-        if temp_profile:
-            temp_profile[-1] = t_exit
-        if pressure_profile:
-            pressure_profile[-1] = p_exit
-        if pt_profile_list:
-            pt_profile_list[-1] = pt_exit
 
         # ------------------------------------------------------------------ #
         #  Divergence efficiency & thrust                                     #

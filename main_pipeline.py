@@ -5,6 +5,7 @@ import importlib.util
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Dict, Any
 
@@ -116,9 +117,25 @@ def build_geometry_from_params(params: Dict[str, float], throat_radius: float, n
     )
 
 
+def _log(msg: str, t0: float) -> None:
+    elapsed = time.time() - t0
+    mins, secs = divmod(int(elapsed), 60)
+    tag = f"[{mins:02d}:{secs:02d}]"
+    print(f"{tag}  {msg}", flush=True)
+
+
 def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
+    t0 = time.time()
     out_dir = Path(config["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    backend = str(config.get("evaluator", {}).get("backend", "quasi1d")).lower()
+    n_cands = config.get("optimization", {}).get("n_samples", "?")
+    algorithm = config.get("optimization", {}).get("algorithm", "?")
+    _log(f"Pipeline START  |  backend={backend}  algorithm={algorithm}  n_samples={n_cands}", t0)
+    _log(f"Output → {out_dir.resolve()}", t0)
+    if backend == "openfoam":
+        _log("⚑  OpenFOAM RANS mode — each candidate will launch rhoSimpleFoam in Docker", t0)
 
     # 1) Generate MOC baseline geometry.
     moc_cfg = config["moc"]
@@ -130,6 +147,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     moc_geometry = moc_solver.generateGeometry({**moc_cfg["geometry"]})
     moc_geometry.metadata["id"] = "moc_baseline"
 
+    _log(f"MOC geometry generated  |  Me={moc_cfg['mach_exit']}  throat={moc_cfg['geometry']['throat_y']*1000:.1f} mm", t0)
     moc_geometry.exportGeo(str(out_dir / "moc_geometry.csv"))
     moc_geometry.plotProfile(str(out_dir / "moc_geometry.png"))
     moc_solver.plotCharacteristics(moc_geometry, str(out_dir / "moc_characteristics.png"))
@@ -172,15 +190,25 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         geom = build_geometry_from_params(param_dict, throat, n_points, profile, gid)
         # Create a fresh evaluator per call so parallel workers don't share state.
         local_eval = make_evaluator(geom)
+        t_start = time.time()
         try:
             result = local_eval.extractResults()
             result.geometryId = gid
+            elapsed_c = time.time() - t_start
+            status_tag = result.metadata.get("backend", backend)
+            _log(
+                f"  {gid}  thrust={result.thrust:8.2f} N  loss={result.pressureLoss:.4f}"
+                f"  [{status_tag}  {elapsed_c:.1f}s]",
+                t0,
+            )
             if require_rans and not is_rans_converged(result):
                 raise RuntimeError(
                     f"Candidate {gid} not RANS-converged (backend={result.metadata.get('backend', 'unknown')})"
                 )
             return result
         except Exception as exc:
+            elapsed_c = time.time() - t_start
+            _log(f"  {gid}  FAILED  [{elapsed_c:.1f}s]  {exc}", t0)
             # Penalize failed CFD candidates so optimization can continue.
             return EvaluationResult(
                 machProfile=[],
@@ -196,11 +224,14 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         algorithm=str(opt_cfg.get("algorithm", "ga")),
         seed=int(opt_cfg.get("seed", 42)),
     )
+    _log(f"Optimization START  |  {n_cands} candidates  backend={backend}", t0)
     runner = OptimizationRunner(optimizer=optimizer, evaluator=evaluator, historyPath=str(out_dir / "optimization_history.json"))
     runner.start()
     runner.saveHistory()
+    _log(f"Optimization DONE   |  evaluated {len(optimizer._history)} candidates", t0)
 
     # ── Multi-objective ranking (Pareto analysis on full history) ──────────
+    _log("Running Pareto / multi-objective ranking…", t0)
     mo_summary: Dict[str, Any] = {}
     if _run_multiobjective is not None and len(optimizer._history) > 1:
         history_records = []
@@ -243,6 +274,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     optimized_geometry.plotProfile(str(out_dir / "optimized_geometry.png"))
 
     # 3) Benchmark MOC vs optimized with same evaluator.
+    _log("Benchmark START  |  evaluating MOC and optimized geometry…", t0)
     bench_eval = make_evaluator(moc_geometry)
     suite = BenchmarkSuite(mocGeometry=moc_geometry, optimizedGeometry=optimized_geometry, evaluator=bench_eval)
     comparison: Dict[str, Any]
@@ -315,6 +347,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     note.save(str(out_dir / "report.md"))
     note.saveJSON(str(out_dir / "report.json"))
 
+    elapsed_total = time.time() - t0
     summary = {
         "status": "ok" if not benchmark_error else "failed",
         "out_dir": str(out_dir),
@@ -322,8 +355,10 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         "optimized_geometry": str(out_dir / "optimized_geometry.csv"),
         "comparison": comparison,
         "multiobjective": mo_summary,
+        "elapsed_seconds": round(elapsed_total, 1),
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    _log(f"Pipeline DONE   |  status={summary['status']}  elapsed={elapsed_total:.1f}s", t0)
     return summary
 
 
@@ -354,7 +389,50 @@ def main() -> None:
         cfg["out_dir"] = args.out
 
     summary = run_pipeline(cfg)
-    print(json.dumps(summary, indent=2))
+
+    # ── Formatted results output ──────────────────────────────────────────
+    cmp = summary.get("comparison", {})
+    mo  = summary.get("multiobjective", {})
+    sep = "─" * 52
+
+    print()
+    print(sep)
+    print("  NOZZLE DESIGN BENCHMARK — RESULTS")
+    print(sep)
+    print(f"  Status          : {summary.get('status', '?').upper()}")
+    print(f"  Elapsed         : {summary.get('elapsed_seconds', 0):.1f} s")
+    print(f"  Output dir      : {summary.get('out_dir', '')}")
+    print(sep)
+
+    if cmp and cmp.get("status") != "failed":
+        print("  PERFORMANCE COMPARISON")
+        print(f"  {'':25s}  {'MOC':>10s}  {'OPT':>10s}  {'Δ':>10s}")
+        moc_t  = cmp.get("moc_thrust", 0)
+        opt_t  = cmp.get("optimized_thrust", 0)
+        moc_pl = cmp.get("moc_pressure_loss", 0)
+        opt_pl = cmp.get("optimized_pressure_loss", 0)
+        d_t_pct = cmp.get("delta_thrust_percent", 0)
+        print(f"  {'Thrust [N]':25s}  {moc_t:>10.3f}  {opt_t:>10.3f}  {cmp.get('delta_thrust', 0):>+10.3f} ({d_t_pct:+.2f}%)")
+        print(f"  {'Pressure loss [-]':25s}  {moc_pl:>10.4f}  {opt_pl:>10.4f}  {cmp.get('delta_pressure_loss', 0):>+10.4f}")
+        print(sep)
+
+    if mo and "best_by_thrust" in mo:
+        best = mo.get("best_by_thrust", {})
+        p    = best.get("params", {})
+        print("  BEST CANDIDATE (by thrust)")
+        print(f"  Thrust          : {best.get('thrust', 0):.3f} N")
+        print(f"  Pressure loss   : {best.get('pressureLoss', 0):.4f}")
+        print(f"  exit_radius     : {p.get('exit_radius', 0)*1000:.2f} mm")
+        print(f"  length          : {p.get('length', 0)*1000:.1f} mm")
+        print(f"  shape           : {p.get('shape', 0):.3f}")
+        pf = mo.get("pareto_front_size", "?")
+        nc = mo.get("n_candidates", "?")
+        print(f"  Pareto front    : {pf} / {nc} candidates")
+        print(sep)
+
+    print(f"  report.md  → {summary.get('out_dir', '')}/report.md")
+    print(sep)
+    print()
 
 
 if __name__ == "__main__":
