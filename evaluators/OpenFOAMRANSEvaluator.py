@@ -240,7 +240,7 @@ relaxationFactors
     version 2.0;
     format ascii;
     class dictionary;
-    object thermophysicalProperties;
+    object physicalProperties;
 }
 
 thermoType
@@ -272,7 +272,7 @@ mixture
     }
 }
 """
-        (case_dir / "constant" / "thermophysicalProperties").write_text(txt, encoding="utf-8")
+        (case_dir / "constant" / "physicalProperties").write_text(txt, encoding="utf-8")
 
     def _write_turbulence(self, case_dir: Path) -> None:
         txt = """FoamFile
@@ -280,19 +280,19 @@ mixture
     version 2.0;
     format ascii;
     class dictionary;
-    object turbulenceProperties;
+    object momentumTransport;
 }
 
 simulationType RAS;
 
 RAS
 {
-    RASModel kEpsilon;
-    turbulence on;
-    printCoeffs on;
+    model           kEpsilon;
+    turbulence      on;
+    printCoeffs     on;
 }
 """
-        (case_dir / "constant" / "turbulenceProperties").write_text(txt, encoding="utf-8")
+        (case_dir / "constant" / "momentumTransport").write_text(txt, encoding="utf-8")
 
     def _write_transport(self, case_dir: Path) -> None:
         txt = """FoamFile
