@@ -1,5 +1,5 @@
 {
-  "_comment": "Supersonic 2-D RANS — proper supersonic outlet (zeroGradient+pRefCell). 160x72 mesh, 2000 iters. ~8-15 min per candidate.",
+  "_comment": "Supersonic 2-D RANS (shockFluid). 160x72 mesh; end_time in seconds; adaptive CFL (maxCo=0.5). ~10-25 min per candidate.",
   "out_dir": "out/rans_2d_supersonic",
   "moc": {
     "mach_exit": 2.3,
@@ -19,8 +19,10 @@
     "depth": 0.02,
     "mesh_nx": 160,
     "mesh_ny": 72,
-    "end_time": 2000,
-    "write_interval": 500,
+    "end_time": 0.01,
+    "write_interval": 0.002,
+    "max_co": 0.2,
+    "delta_t_init": 1e-7,
     "gamma": 1.4,
     "stagnation_temperature": 900.0,
     "stagnation_pressure": 300000.0,

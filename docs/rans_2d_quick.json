@@ -1,5 +1,5 @@
 {
-  "_comment": "Quick 2-D OpenFOAM test. Requires Docker + OpenFOAM 13 image. ~15-40 min per candidate.",
+  "_comment": "Quick 2-D OpenFOAM test (shockFluid). end_time in seconds; adaptive CFL (maxCo=0.5). ~3-8 min per candidate.",
   "out_dir": "out/rans_2d_quick",
   "moc": {
     "mach_exit": 2.3,
@@ -19,8 +19,10 @@
     "depth": 0.02,
     "mesh_nx": 80,
     "mesh_ny": 36,
-    "end_time": 500,
-    "write_interval": 100,
+    "end_time": 0.001,
+    "write_interval": 0.0005,
+    "max_co": 0.5,
+    "delta_t_init": 1e-7,
     "gamma": 1.4,
     "stagnation_temperature": 900.0,
     "stagnation_pressure": 300000.0,

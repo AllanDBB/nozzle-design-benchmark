@@ -140,7 +140,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     _log(f"Pipeline START  |  backend={backend}  algorithm={algorithm}  n_samples={n_cands}", t0)
     _log(f"Output → {out_dir.resolve()}", t0)
     if backend == "openfoam":
-        _log("⚑  OpenFOAM RANS mode — each candidate will launch rhoSimpleFoam in Docker", t0)
+        _log("⚑  OpenFOAM RANS mode — each candidate will run shockFluid (density-based Kurganov) in Docker", t0)
 
     # 1) Generate MOC baseline geometry.
     moc_cfg = config["moc"]
@@ -171,7 +171,10 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     def make_evaluator(geometry: NozzleGeometry):
         backend = str(eval_cfg.get("backend", "quasi1d")).lower()
         if backend == "openfoam":
-            return OpenFOAMRANSEvaluator(geometry=geometry, solverConfig=eval_cfg, resultPath=str(out_dir))
+            # Inject mach_exit from MOC config so shockFluid can hot-start at
+            # the correct supersonic IC rather than having to guess from geometry.
+            cfg_with_mach = {**eval_cfg, "mach_exit": float(moc_cfg.get("mach_exit", 2.3))}
+            return OpenFOAMRANSEvaluator(geometry=geometry, solverConfig=cfg_with_mach, resultPath=str(out_dir))
         return CFDSimulation(geometry=geometry, solverConfig=eval_cfg, resultPath=str(out_dir))
 
     evaluator = make_evaluator(moc_geometry)

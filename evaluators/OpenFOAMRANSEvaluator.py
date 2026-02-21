@@ -15,7 +15,7 @@ from .CFDSimulation import CFDSimulation
 
 @dataclass
 class OpenFOAMRANSEvaluator:
-    """Steady compressible RANS evaluator using OpenFOAM (rhoSimpleFoam).
+    """Steady compressible RANS evaluator using OpenFOAM (shockFluid — density-based Kurganov).
 
     Supports:
     - 2D planar (single-cell thickness, front/back = empty)
@@ -50,8 +50,13 @@ class OpenFOAMRANSEvaluator:
         return case_dir
 
     def _write_control_dict(self, case_dir: Path) -> None:
-        end_time = int(self.solverConfig.get("end_time", 1200))
-        write_interval = int(self.solverConfig.get("write_interval", 200))
+        # end_time is in physical seconds (e.g. 0.005 = 5 ms ≈ 25 flow-through times).
+        # deltaT is just the initial guess; adjustTimeStep + maxCo will grow it
+        # automatically up to the CFL-stable limit every step.
+        end_time = float(self.solverConfig.get("end_time", 0.005))
+        write_interval = float(self.solverConfig.get("write_interval", end_time / 5.0))
+        max_co = float(self.solverConfig.get("max_co", 0.5))
+        dt_init = float(self.solverConfig.get("delta_t_init", 1e-7))
         txt = f"""FoamFile
 {{
     version 2.0;
@@ -60,13 +65,15 @@ class OpenFOAMRANSEvaluator:
     object controlDict;
 }}
 
-application     foamRun;
+solver          shockFluid;
 startFrom       startTime;
 startTime       0;
 stopAt          endTime;
 endTime         {end_time};
-deltaT          1;
-writeControl    timeStep;
+deltaT          {dt_init};
+adjustTimeStep  yes;
+maxCo           {max_co};
+writeControl    runTime;
 writeInterval   {write_interval};
 purgeWrite      0;
 writeFormat     ascii;
@@ -127,9 +134,14 @@ functions
     object fvSchemes;
 }
 
+// shockFluid: density-based Kurganov scheme.
+// No pressure equation — rho/rhoU/rhoE solved directly.
+// vanAlbada reconstructors provide TVD-like limiting without negative densities.
+fluxScheme      Kurganov;
+
 ddtSchemes
 {
-    default steadyState;
+    default Euler;
 }
 
 gradSchemes
@@ -138,24 +150,16 @@ gradSchemes
     limited         cellLimited Gauss linear 1;
     grad(U)         $limited;
     grad(k)         $limited;
-    grad(epsilon)   $limited;
+    grad(omega)     $limited;
 }
 
 divSchemes
 {
     default         none;
 
-    div(phi,U)      Gauss upwind;
-    div(phid,p)     Gauss limitedLinear 1;
-
-    energy              Gauss limitedLinear 1;
-    div(phi,h)          $energy;
-    div(phi,K)          $energy;
-    div(phi,(p|rho))    Gauss limitedLinear 1;
-
-    turbulence      Gauss upwind;
+    turbulence      Gauss limitedLinear 1;
     div(phi,k)      $turbulence;
-    div(phi,epsilon) $turbulence;
+    div(phi,omega)  $turbulence;
 
     div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;
 }
@@ -167,7 +171,11 @@ laplacianSchemes
 
 interpolationSchemes
 {
-    default linear;
+    default         linear;
+
+    reconstruct(rho)    vanAlbada;
+    reconstruct(U)      vanAlbadaV;
+    reconstruct(T)      vanAlbada;
 }
 
 snGradSchemes
@@ -183,76 +191,44 @@ wallDist
         (case_dir / "system" / "fvSchemes").write_text(txt, encoding="utf-8")
 
     def _write_fv_solution(self, case_dir: Path) -> None:
-        pa = float(self.solverConfig.get("ambient_pressure", 1.0e5))
-        txt = f"""FoamFile
-{{
+        txt = """FoamFile
+{
     version 2.0;
     format ascii;
     class dictionary;
     object fvSolution;
-}}
+}
 
+// shockFluid: density-based solver — no pressure equation.
+// The conserved variables (rho, rhoU, rhoE) are updated from the Kurganov
+// flux divergence, then U and e are extracted from them.
 solvers
-{{
+{
     "rho.*"
-    {{
+    {
         solver          diagonal;
-    }}
+    }
 
-    "p.*"
-    {{
+    "(U|e|k|omega).*"
+    {
         solver          smoothSolver;
         smoother        symGaussSeidel;
-        tolerance       1e-7;
-        relTol          0;
-    }}
-
-    "(U|h|k|epsilon).*"
-    {{
-        solver          PBiCGStab;
-        preconditioner  DILU;
-        tolerance       1e-7;
-        relTol          0.1;
-    }}
-}}
+        nSweeps         2;
+        tolerance       1e-9;
+        relTol          0.01;
+    }
+}
 
 PIMPLE
-{{
-    transonic           yes;
-    nOuterCorrectors    2;
-    nCorrectors         1;
-    nNonOrthogonalCorrectors 0;
-
-    pRefCell    0;
-    pRefValue   {pa};
-
-    residualControl
-    {{
-        p               1e-4;
-        U               1e-5;
-        "(h|k|epsilon)" 1e-5;
-    }}
-}}
-
-relaxationFactors
-{{
-    fields
-    {{
-        p       0.2;
-        rho     0.05;
-    }}
-    equations
-    {{
-        U       0.3;
-        h       0.1;
-        k       0.2;
-        epsilon 0.2;
-    }}
-}}
+{
+    nOuterCorrectors 1;
+}
 """
         (case_dir / "system" / "fvSolution").write_text(txt, encoding="utf-8")
 
-        # OF13: pressure and temperature bounds in fvConstraints
+        # fvConstraints: limitTemperature prevents SIGFPE from negative internal
+        # energy during the transient supersonic startup — shocks can temporarily
+        # push T negative in a cell before the TVD limiters stabilise the field.
         fc_txt = """FoamFile
 {
     version 2.0;
@@ -261,19 +237,12 @@ relaxationFactors
     object fvConstraints;
 }
 
-limitp
-{
-    type    limitPressure;
-    min     1000;
-    max     1e8;
-}
-
 limitT
 {
     type        limitTemperature;
     cellZone    all;
     min         50;
-    max         8000;
+    max         5000;
 }
 """
         (case_dir / "system" / "fvConstraints").write_text(fc_txt, encoding="utf-8")
@@ -297,32 +266,34 @@ limitT
     object physicalProperties;
 }
 
+// shockFluid requires sensibleInternalEnergy + eConst + hePsiThermo.
+// Sutherland transport is physically correct for high-T compressible flows.
 thermoType
 {
     type            hePsiThermo;
     mixture         pureMixture;
-    transport       const;
-    thermo          hConst;
+    transport       sutherland;
+    thermo          eConst;
     equationOfState perfectGas;
     specie          specie;
-    energy          sensibleEnthalpy;
+    energy          sensibleInternalEnergy;
 }
 
 mixture
 {
     specie
     {
-        molWeight   28.96;
+        molWeight   28.96;   // air
     }
     thermodynamics
     {
-        Cp          1004.5;
-        hf          0;
+        Cv          717.5;   // Cv = Cp/gamma = 1004.5/1.4
+        Hf          0;
     }
     transport
     {
-        mu          3.5e-05;
-        Pr          0.72;
+        As          1.458e-06;
+        Ts          110.4;
     }
 }
 """
@@ -341,7 +312,9 @@ simulationType RAS;
 
 RAS
 {
-    model           kEpsilon;
+    // kOmegaSST: better near-wall and free-shear behaviour than kEpsilon,
+    // and used in the canonical diffuserIntake shockFluid tutorial.
+    model           kOmegaSST;
     turbulence      on;
     printCoeffs     on;
 }
@@ -478,30 +451,118 @@ mergePatchPairs();
 """
         (case_dir / "system" / "blockMeshDict").write_text(txt, encoding="utf-8")
 
-    def _write_initial_fields(self, case_dir: Path) -> None:
-        p0 = float(self.solverConfig.get("stagnation_pressure", 1.5e6))
-        t0 = float(self.solverConfig.get("stagnation_temperature", 1000.0))
-        pa = float(self.solverConfig.get("ambient_pressure", 1.0e4))
-        k_in = float(self.solverConfig.get("k_inlet", 5.0))
-        epsilon_in = float(self.solverConfig.get("epsilon_inlet", 50.0))
-        p_init = float(self.solverConfig.get("p_initial", 0.9 * p0))
-        u_init = float(self.solverConfig.get("u_initial", 1.0))
-        t_init = float(self.solverConfig.get("t_initial", t0))
-        gamma_cf = float(self.solverConfig.get("gamma", 1.4))
+    def _isentropic_mach_from_area_ratio(self, AR: float, gamma: float, supersonic: bool) -> float:
+        """Solve A/A* → Mach via isentropic area relation (Newton iteration)."""
+        import math as _m
+        # A/A* = (1/M) * ((2/(γ+1)) * (1 + (γ-1)/2 * M²))^((γ+1)/(2*(γ-1)))
+        gp1 = gamma + 1.0
+        gm1 = gamma - 1.0
+        exp = gp1 / (2.0 * gm1)
+        M = 2.0 if supersonic else 0.3  # initial guess
+        for _ in range(80):
+            fac = 1.0 + 0.5 * gm1 * M * M
+            AR_calc = (1.0 / M) * (2.0 / gp1 * fac) ** exp
+            # dAR/dM
+            dAR = (AR_calc / M) * (-1.0 + M * M * gm1 / fac)
+            err = AR_calc - AR
+            if abs(err) < 1e-10 * AR:
+                break
+            M -= err / dAR
+            M = max(1e-6, M) if not supersonic else max(1.0001, M)
+        return M
 
-        # Guard: if u_initial is unrealistically low (< 50 m/s), compute
-        # a sane M=0.3 isentropic state from stagnation conditions.
-        # A uniform supersonic IC causes the first GAMG pressure correction
-        # to overflow because of the large velocity divergence in the duct.
-        import math as _math
+    def _write_1d_isentropic_ic(self, case_dir: Path) -> None:
+        """Write non-uniform initial fields based on 1-D isentropic profile.
+
+        Cell centres are estimated from blockMesh geometry.  In the converging
+        section cells get the subsonic isentropic state; in the diverging section
+        they get the supersonic state.  This "hot start" lets shockFluid reach
+        the quasi-steady supersonic solution within 1-2 flow-through times
+        without the transient shocks that crash the solver from a uniform IC.
+        """
+        import math as _m
+
+        p0 = float(self.solverConfig.get("stagnation_pressure", 1.5e6))
+        pa = float(self.solverConfig.get("ambient_pressure", 1.0e5))
+        t0_gas = float(self.solverConfig.get("stagnation_temperature", 1000.0))
+        k_in = float(self.solverConfig.get("k_inlet", 5.0))
+        gamma = float(self.solverConfig.get("gamma", 1.4))
         _R = 287.0
-        if u_init < 50.0:
-            _M0 = 0.3
-            _fac = 1.0 + (gamma_cf - 1.0) / 2.0 * _M0 ** 2
-            t_init = t0 / _fac
-            p_init = p0 / _fac ** (gamma_cf / (gamma_cf - 1.0))
-            u_init = _M0 * _math.sqrt(gamma_cf * _R * t_init)
+        nx = int(self.solverConfig.get("mesh_nx", 80))
+        ny = int(self.solverConfig.get("mesh_ny", 36))
         mode = str(self.solverConfig.get("dimension", "2d_planar"))
+        nz = 1 if mode == "2d_planar" else int(self.solverConfig.get("mesh_nz", 12))
+
+        pts = self.geometry.control_points  # list of (x, y) — nozzle wall
+
+        # Find throat: minimum y value in control points → maximum curvature
+        x_coords = [p[0] for p in pts]
+        y_coords = [p[1] for p in pts]
+        x0_geo = x_coords[0]
+        x1_geo = x_coords[-1]
+        y0 = y_coords[0]  # inlet half-height
+        yn = y_coords[-1]  # exit half-height
+        ithroat = min(range(len(y_coords)), key=lambda i: y_coords[i])
+        x_throat = x_coords[ithroat]
+        y_throat = y_coords[ithroat]
+        A_throat = y_throat  # 2D: area ∝ y (half-height per unit depth)
+
+        # Build interpolating function: x → half-height y(x)
+        import bisect as _bs
+
+        def y_at_x(x: float) -> float:
+            if x <= x0_geo:
+                return y0
+            if x >= x1_geo:
+                return yn
+            i = _bs.bisect_left(x_coords, x)
+            if i == 0:
+                return y_coords[0]
+            if i >= len(x_coords):
+                return y_coords[-1]
+            x_lo, x_hi = x_coords[i - 1], x_coords[i]
+            y_lo, y_hi = y_coords[i - 1], y_coords[i]
+            t = (x - x_lo) / (x_hi - x_lo + 1e-30)
+            return y_lo + t * (y_hi - y_lo)
+
+        # Cell centres along x — blockMesh uniform spacing
+        dx = (x1_geo - x0_geo) / nx
+        x_centers = [x0_geo + (i + 0.5) * dx for i in range(nx)]
+
+        # Per-cell 1D isentropic state
+        p_cells: list[float] = []
+        t_cells: list[float] = []
+        u_cells: list[float] = []
+
+        for xc in x_centers:
+            y_local = max(y_at_x(xc), 1e-6)
+            AR = y_local / A_throat  # area ratio (per unit depth)
+            supersonic = (xc > x_throat)
+            if AR <= 1.0 + 1e-4:
+                M = 1.0
+            else:
+                M = self._isentropic_mach_from_area_ratio(AR, gamma, supersonic)
+            fac = 1.0 + 0.5 * (gamma - 1.0) * M * M
+            p_c = p0 / fac ** (gamma / (gamma - 1.0))
+            t_c = t0_gas / fac
+            a_c = _m.sqrt(gamma * _R * max(t_c, 1.0))
+            u_c = M * a_c
+            p_cells.append(max(p_c, 100.0))
+            t_cells.append(max(t_c, 1.0))
+            u_cells.append(u_c)
+
+        # Inlet state (M≈0.3 isentropic)
+        AR_inlet = y0 / A_throat
+        M_inlet = self._isentropic_mach_from_area_ratio(AR_inlet, gamma, False)
+        fac_in = 1.0 + 0.5 * (gamma - 1.0) * M_inlet ** 2
+        p_inlet = p0 / fac_in ** (gamma / (gamma - 1.0))
+        t_inlet = t0_gas / fac_in
+        u_inlet = M_inlet * _m.sqrt(gamma * _R * max(t_inlet, 1.0))
+
+        # omega from k
+        l_mix = 0.07 * 2.0 * y_throat
+        omega_in = _m.sqrt(k_in) / (0.09 ** 0.25 * max(l_mix, 1e-6))
+
         is_2d = mode == "2d_planar"
         front_p = "empty" if is_2d else "zeroGradient"
         back_p = "empty" if is_2d else "zeroGradient"
@@ -511,15 +572,46 @@ mergePatchPairs();
         back_t = "empty" if is_2d else "zeroGradient"
         front_k = "empty" if is_2d else "kqRWallFunction"
         back_k = "empty" if is_2d else "kqRWallFunction"
-        front_eps = "empty" if is_2d else "epsilonWallFunction"
-        back_eps = "empty" if is_2d else "epsilonWallFunction"
+        front_om = "empty" if is_2d else "omegaWallFunction"
+        back_om = "empty" if is_2d else "omegaWallFunction"
         front_nut = "empty" if is_2d else "nutkWallFunction"
         back_nut = "empty" if is_2d else "nutkWallFunction"
         front_alphat = "empty" if is_2d else "compressible::alphatWallFunction"
         back_alphat = "empty" if is_2d else "compressible::alphatWallFunction"
 
-        # ── p ──────────────────────────────────────────────────────────────
-        # totalPressure without explicit gamma – uses thermo model internally.
+        # Non-uniform internal field: each "strip" of ny*nz cells at same x gets the same value.
+        n_cells = nx * ny * nz
+        # OpenFOAM blockMesh orders cells: k (z) varies fastest, then j (y), then i (x).
+        # So cell index = i*ny*nz + j*nz + k.  For a fixed i (x-slice), all ny*nz cells
+        # share the same x-center → same 1D value.
+        def _nonuniform_scalar(vals_per_x: list, ny: int, nz: int) -> str:
+            n = len(vals_per_x) * ny * nz
+            lines = [f"nonuniform List<scalar>", f"{n}", "("]
+            for v in vals_per_x:
+                for _ in range(ny * nz):
+                    lines.append(f"{v:.6g}")
+            lines.append(")")
+            return "\n".join(lines)
+
+        def _nonuniform_vector(ux_per_x: list, ny: int, nz: int) -> str:
+            n = len(ux_per_x) * ny * nz
+            lines = [f"nonuniform List<vector>", f"{n}", "("]
+            for ux in ux_per_x:
+                for _ in range(ny * nz):
+                    lines.append(f"({ux:.6g} 0 0)")
+            lines.append(")")
+            return "\n".join(lines)
+
+        p_nonuniform = _nonuniform_scalar(p_cells, ny, nz)
+        t_nonuniform = _nonuniform_scalar(t_cells, ny, nz)
+        u_nonuniform = _nonuniform_vector(u_cells, ny, nz)
+        k_uniform = k_in
+        om_uniform = omega_in
+
+        # lInf: reference length for waveTransmissive acoustic-wave correction
+        # Use the domain x-length (nozzle length) as the reference
+        l_inf = float(x1_geo - x0_geo)
+
         p_txt = f"""FoamFile
 {{
     version 2.0;
@@ -527,19 +619,24 @@ mergePatchPairs();
     class volScalarField;
     object p;
 }}
-
 dimensions [1 -1 -2 0 0 0 0];
-internalField uniform {p_init};
+internalField {p_nonuniform};
 boundaryField
 {{
-    inlet {{ type totalPressure; p0 uniform {p0}; gamma 1.4; value uniform {p_init}; }}
-    outlet {{
+    inlet
+    {{
+        type            fixedValue;
+        value           uniform {p_inlet:.4f};
+    }}
+    outlet
+    {{
         type            waveTransmissive;
         field           p;
-        gamma           1.4;
-        fieldInf        {pa};
-        lInf            0.5;
-        value           uniform {pa};
+        psi             psi;
+        gamma           {gamma};
+        fieldInf        {pa:.4f};
+        lInf            {l_inf:.6g};
+        value           uniform {pa:.4f};
     }}
     upperWall {{ type zeroGradient; }}
     lowerWall {{ type zeroGradient; }}
@@ -548,8 +645,6 @@ boundaryField
 }}
 """
 
-        # ── U ──────────────────────────────────────────────────────────────
-        # pressureInletVelocity is the correct companion to totalPressure.
         u_txt = f"""FoamFile
 {{
     version 2.0;
@@ -557,13 +652,17 @@ boundaryField
     class volVectorField;
     object U;
 }}
-
 dimensions [0 1 -1 0 0 0 0];
-internalField uniform ({u_init} 0 0);
+internalField {u_nonuniform};
 boundaryField
 {{
-    inlet {{ type pressureInletVelocity; value uniform ({u_init} 0 0); }}
-    outlet {{ type inletOutlet; inletValue uniform ({u_init} 0 0); value uniform ({u_init} 0 0); }}
+    inlet     {{ type fixedValue; value uniform ({u_inlet:.4f} 0 0); }}
+    outlet
+    {{
+        type            inletOutlet;
+        inletValue      uniform (0 0 0);
+        value           uniform (0 0 0);
+    }}
     upperWall {{ type noSlip; }}
     lowerWall {{ type noSlip; }}
     front {{ type {front_u}; }}
@@ -571,7 +670,6 @@ boundaryField
 }}
 """
 
-        # ── T ──────────────────────────────────────────────────────────────
         t_txt = f"""FoamFile
 {{
     version 2.0;
@@ -579,13 +677,12 @@ boundaryField
     class volScalarField;
     object T;
 }}
-
 dimensions [0 0 0 1 0 0 0];
-internalField uniform {t_init};
+internalField {t_nonuniform};
 boundaryField
 {{
-    inlet {{ type fixedValue; value uniform {t0}; }}
-    outlet {{ type inletOutlet; inletValue uniform {t_init}; value uniform {t_init}; }}
+    inlet     {{ type fixedValue; value uniform {t_inlet:.2f}; }}
+    outlet    {{ type zeroGradient; }}
     upperWall {{ type zeroGradient; }}
     lowerWall {{ type zeroGradient; }}
     front {{ type {front_t}; }}
@@ -593,7 +690,6 @@ boundaryField
 }}
 """
 
-        # ── k ──────────────────────────────────────────────────────────────
         k_txt = f"""FoamFile
 {{
     version 2.0;
@@ -601,13 +697,12 @@ boundaryField
     class volScalarField;
     object k;
 }}
-
 dimensions [0 2 -2 0 0 0 0];
-internalField uniform {k_in};
+internalField uniform {k_uniform};
 boundaryField
 {{
-    inlet {{ type fixedValue; value uniform {k_in}; }}
-    outlet {{ type zeroGradient; }}
+    inlet     {{ type turbulentIntensityKineticEnergyInlet; intensity 0.005; value uniform {k_uniform}; }}
+    outlet    {{ type inletOutlet; inletValue uniform {k_uniform}; value uniform {k_uniform}; }}
     upperWall {{ type kqRWallFunction; value uniform 1e-10; }}
     lowerWall {{ type kqRWallFunction; value uniform 1e-10; }}
     front {{ type {front_k}; {'value uniform 1e-10;' if not is_2d else ''} }}
@@ -615,29 +710,26 @@ boundaryField
 }}
 """
 
-        # ── epsilon ─────────────────────────────────────────────────────────
-        eps_txt = f"""FoamFile
+        om_txt = f"""FoamFile
 {{
     version 2.0;
     format ascii;
     class volScalarField;
-    object epsilon;
+    object omega;
 }}
-
-dimensions [0 2 -3 0 0 0 0];
-internalField uniform {epsilon_in};
+dimensions [0 0 -1 0 0 0 0];
+internalField uniform {om_uniform:.2f};
 boundaryField
 {{
-    inlet {{ type fixedValue; value uniform {epsilon_in}; }}
-    outlet {{ type zeroGradient; }}
-    upperWall {{ type epsilonWallFunction; value uniform 1e-10; }}
-    lowerWall {{ type epsilonWallFunction; value uniform 1e-10; }}
-    front {{ type {front_eps}; {'value uniform 1e-10;' if not is_2d else ''} }}
-    back {{ type {back_eps}; {'value uniform 1e-10;' if not is_2d else ''} }}
+    inlet     {{ type fixedValue; value uniform {om_uniform:.2f}; }}
+    outlet    {{ type inletOutlet; inletValue uniform {om_uniform:.2f}; value uniform {om_uniform:.2f}; }}
+    upperWall {{ type omegaWallFunction; value uniform {om_uniform:.2f}; }}
+    lowerWall {{ type omegaWallFunction; value uniform {om_uniform:.2f}; }}
+    front {{ type {front_om}; {'value uniform ' + f'{om_uniform:.2f};' if not is_2d else ''} }}
+    back {{ type {back_om}; {'value uniform ' + f'{om_uniform:.2f};' if not is_2d else ''} }}
 }}
 """
 
-        # ── nut ─────────────────────────────────────────────────────────────
         nut_txt = f"""FoamFile
 {{
     version 2.0;
@@ -645,13 +737,12 @@ boundaryField
     class volScalarField;
     object nut;
 }}
-
 dimensions [0 2 -1 0 0 0 0];
 internalField uniform 0;
 boundaryField
 {{
-    inlet {{ type calculated; value uniform 0; }}
-    outlet {{ type calculated; value uniform 0; }}
+    inlet     {{ type calculated; value uniform 0; }}
+    outlet    {{ type calculated; value uniform 0; }}
     upperWall {{ type nutkWallFunction; value uniform 0; }}
     lowerWall {{ type nutkWallFunction; value uniform 0; }}
     front {{ type {front_nut}; {'value uniform 0;' if not is_2d else ''} }}
@@ -659,7 +750,6 @@ boundaryField
 }}
 """
 
-        # ── alphat ──────────────────────────────────────────────────────────
         alphat_txt = f"""FoamFile
 {{
     version 2.0;
@@ -667,13 +757,12 @@ boundaryField
     class volScalarField;
     object alphat;
 }}
-
 dimensions [1 -1 -1 0 0 0 0];
 internalField uniform 0;
 boundaryField
 {{
-    inlet {{ type calculated; value uniform 0; }}
-    outlet {{ type calculated; value uniform 0; }}
+    inlet     {{ type calculated; value uniform 0; }}
+    outlet    {{ type calculated; value uniform 0; }}
     upperWall {{ type compressible::alphatWallFunction; value uniform 0; }}
     lowerWall {{ type compressible::alphatWallFunction; value uniform 0; }}
     front {{ type {front_alphat}; {'value uniform 0;' if not is_2d else ''} }}
@@ -685,7 +774,7 @@ boundaryField
         (case_dir / "0" / "U").write_text(u_txt, encoding="utf-8")
         (case_dir / "0" / "T").write_text(t_txt, encoding="utf-8")
         (case_dir / "0" / "k").write_text(k_txt, encoding="utf-8")
-        (case_dir / "0" / "epsilon").write_text(eps_txt, encoding="utf-8")
+        (case_dir / "0" / "omega").write_text(om_txt, encoding="utf-8")
         (case_dir / "0" / "nut").write_text(nut_txt, encoding="utf-8")
         (case_dir / "0" / "alphat").write_text(alphat_txt, encoding="utf-8")
 
@@ -721,7 +810,7 @@ boundaryField
             if not d.exists():
                 raise RuntimeError(
                     f"postProcessing/{name} not found – function objects may not "
-                    f"have run. Check {case_dir / 'log.rhoSimpleFoam'} for errors."
+                    f"have run. Check {case_dir / 'log.shockFluid'} for errors."
                 )
             time_dirs = sorted(
                 [p for p in d.iterdir() if p.is_dir()],
@@ -753,14 +842,12 @@ boundaryField
         return p_out, u_out, t_out, mdot
 
     def _check_convergence(self, case_dir: Path) -> bool:
-        """Return True if rhoSimpleFoam reached its residual convergence target."""
-        log_path = case_dir / "log.rhoSimpleFoam"
+        """Return True if shockFluid reached the end of its run without abort."""
+        log_path = case_dir / "log.shockFluid"
         if not log_path.exists():
             return False
         text = log_path.read_text(encoding="utf-8", errors="replace")
-        if "SIMPLE solution converged" in text:
-            return True
-        # Fallback: at minimum the run must have completed without abort.
+        # shockFluid ends cleanly with "End"; abort shows "FATAL"
         return "End" in text and "FATAL" not in text
 
     def _build_case(self, case_dir: Path) -> None:
@@ -778,7 +865,7 @@ boundaryField
         self._write_turbulence(case_dir)
         self._write_transport(case_dir)
         self._write_block_mesh(case_dir)
-        self._write_initial_fields(case_dir)
+        self._write_1d_isentropic_ic(case_dir)
 
     def run(self) -> None:
         self._lastResult = self.extractResults()
@@ -791,7 +878,7 @@ boundaryField
         try:
             self._run_cmd("blockMesh > log.blockMesh 2>&1", case_dir)
             self._run_cmd("checkMesh > log.checkMesh 2>&1", case_dir)
-            self._run_cmd("foamRun -solver fluid > log.rhoSimpleFoam 2>&1", case_dir)
+            self._run_cmd("foamRun -solver shockFluid > log.shockFluid 2>&1", case_dir)
         except Exception as exc:
             if not bool(self.solverConfig.get("fallback_on_failure", False)):
                 raise
@@ -809,8 +896,8 @@ boundaryField
         converged = self._check_convergence(case_dir)
         if not converged:
             msg = (
-                f"rhoSimpleFoam did not converge for case {gid}. "
-                f"Inspect {case_dir / 'log.rhoSimpleFoam'} for details."
+                f"shockFluid did not converge for case {gid}. "
+                f"Inspect {case_dir / 'log.shockFluid'} for details."
             )
             if not bool(self.solverConfig.get("fallback_on_failure", False)):
                 raise RuntimeError(msg)
