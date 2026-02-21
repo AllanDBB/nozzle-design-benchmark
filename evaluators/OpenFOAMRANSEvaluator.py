@@ -518,7 +518,7 @@ internalField uniform {p_init};
 boundaryField
 {{
     inlet {{ type totalPressure; p0 uniform {p0}; gamma 1.4; value uniform {p_init}; }}
-    outlet {{ type fixedValue; value uniform {pa}; }}
+    outlet {{ type zeroGradient; }}
     upperWall {{ type zeroGradient; }}
     lowerWall {{ type zeroGradient; }}
     front {{ type {front_p}; }}

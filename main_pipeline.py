@@ -128,6 +128,11 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.time()
     out_dir = Path(config["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
+    moc_dir  = out_dir / "moc"
+    opt_dir  = out_dir / "opt"
+    comp_dir = out_dir / "comp"
+    for _d in [moc_dir, opt_dir, comp_dir]:
+        _d.mkdir(parents=True, exist_ok=True)
 
     backend = str(config.get("evaluator", {}).get("backend", "quasi1d")).lower()
     n_cands = config.get("optimization", {}).get("n_samples", "?")
@@ -148,9 +153,9 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     moc_geometry.metadata["id"] = "moc_baseline"
 
     _log(f"MOC geometry generated  |  Me={moc_cfg['mach_exit']}  throat={moc_cfg['geometry']['throat_y']*1000:.1f} mm", t0)
-    moc_geometry.exportGeo(str(out_dir / "moc_geometry.csv"))
-    moc_geometry.plotProfile(str(out_dir / "moc_geometry.png"))
-    moc_solver.plotCharacteristics(moc_geometry, str(out_dir / "moc_characteristics.png"))
+    moc_geometry.exportGeo(str(moc_dir / "moc_geometry.csv"))
+    moc_geometry.plotProfile(str(moc_dir / "moc_geometry.png"))
+    moc_solver.plotCharacteristics(moc_geometry, str(moc_dir / "moc_characteristics.png"))
 
     # 2) Optimize parametrized geometry using CFD-like evaluator.
     eval_cfg = dict(config["evaluator"])
@@ -225,7 +230,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         seed=int(opt_cfg.get("seed", 42)),
     )
     _log(f"Optimization START  |  {n_cands} candidates  backend={backend}", t0)
-    runner = OptimizationRunner(optimizer=optimizer, evaluator=evaluator, historyPath=str(out_dir / "optimization_history.json"))
+    runner = OptimizationRunner(optimizer=optimizer, evaluator=evaluator, historyPath=str(opt_dir / "optimization_history.json"))
     runner.start()
     runner.saveHistory()
     _log(f"Optimization DONE   |  evaluated {len(optimizer._history)} candidates", t0)
@@ -242,7 +247,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         try:
             mo_summary = _run_multiobjective(
                 records=history_records,
-                out_dir=str(out_dir / "multiobjective"),
+                out_dir=str(opt_dir / "multiobjective"),
                 w_thrust=float(opt_cfg.get("w_thrust", 0.7)),
                 w_pressure_loss=float(opt_cfg.get("w_pressure_loss", 0.3)),
             )
@@ -270,8 +275,8 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
     optimized_geometry = build_geometry_from_params(best_params, throat, n_points, profile, "optimized_best")
-    optimized_geometry.exportGeo(str(out_dir / "optimized_geometry.csv"))
-    optimized_geometry.plotProfile(str(out_dir / "optimized_geometry.png"))
+    optimized_geometry.exportGeo(str(opt_dir / "optimized_geometry.csv"))
+    optimized_geometry.plotProfile(str(opt_dir / "optimized_geometry.png"))
 
     # 3) Benchmark MOC vs optimized with same evaluator.
     _log("Benchmark START  |  evaluating MOC and optimized geometry…", t0)
@@ -288,10 +293,10 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
                 raise RuntimeError("MOC benchmark is not RANS-converged.")
             if not is_rans_converged(suite.optResult):
                 raise RuntimeError("Optimized benchmark is not RANS-converged.")
-        comparison = suite.save(str(out_dir))
+        comparison = suite.save(str(comp_dir))
         generate_optimization_plots(
             history=optimizer._history,
-            out_dir=str(out_dir),
+            out_dir=str(opt_dir),
             moc_thrust=suite.mocResult.thrust if suite.mocResult is not None else None,
             moc_pressure_loss=suite.mocResult.pressureLoss if suite.mocResult is not None else None,
             population=int(opt_cfg.get("population", 0)) if str(opt_cfg.get("algorithm", "")).lower() in {"ga", "cma-es", "evolutionary"} else None,
@@ -308,24 +313,24 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
                 optimized_geometry=optimized_geometry,
                 moc_result=suite.mocResult,
                 optimized_result=suite.optResult,
-                out_dir=str(out_dir),
+                out_dir=str(comp_dir),
                 solver_config=eval_cfg,
             )
 
         bench_eval.geometry = moc_geometry
         bench_eval.extractResults()
-        bench_eval.plotFields(str(out_dir / "moc_fields.png"))
+        bench_eval.plotFields(str(moc_dir / "moc_fields.png"))
 
         bench_eval.geometry = optimized_geometry
         bench_eval.extractResults()
-        bench_eval.plotFields(str(out_dir / "optimized_fields.png"))
+        bench_eval.plotFields(str(opt_dir / "optimized_fields.png"))
     except Exception as exc:
         benchmark_error = str(exc)
         comparison = {
             "status": "failed",
             "error": benchmark_error,
         }
-        (out_dir / "comparison.json").write_text(json.dumps(comparison, indent=2), encoding="utf-8")
+        (comp_dir / "comparison.json").write_text(json.dumps(comparison, indent=2), encoding="utf-8")
 
     # 4) Analysis report.
     note = AnalysisNote(
@@ -351,8 +356,11 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     summary = {
         "status": "ok" if not benchmark_error else "failed",
         "out_dir": str(out_dir),
-        "moc_geometry": str(out_dir / "moc_geometry.csv"),
-        "optimized_geometry": str(out_dir / "optimized_geometry.csv"),
+        "moc_geometry": str(moc_dir / "moc_geometry.csv"),
+        "optimized_geometry": str(opt_dir / "optimized_geometry.csv"),
+        "opt_dir": str(opt_dir),
+        "moc_dir": str(moc_dir),
+        "comp_dir": str(comp_dir),
         "comparison": comparison,
         "multiobjective": mo_summary,
         "elapsed_seconds": round(elapsed_total, 1),
