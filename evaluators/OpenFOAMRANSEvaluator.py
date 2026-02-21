@@ -477,14 +477,16 @@ mergePatchPairs();
 
         # Guard: initialising from near-zero velocity causes immediate divergence
         # for compressible high-speed flow.  If u_initial is unrealistically low
-        # (< 50 m/s) compute a sane M≈0.3 isentropic state from stagnation conds.
+        # (< 50 m/s) compute a sane M≈0.3 isentropic state.
+        # For zeroGradient outlet, initialise p near ambient so the solver
+        # builds the inlet gradient rather than collapsing the outlet, which
+        # avoids GAMG divergence into negative pressures.
         import math as _math
         _R = 287.0
         if u_init < 50.0:
             _M0 = 0.3
-            _fac = 1.0 + (gamma_cf - 1.0) / 2.0 * _M0 ** 2
-            t_init = t0 / _fac
-            p_init = p0 / _fac ** (gamma_cf / (gamma_cf - 1.0))
+            p_init = pa  # Start at ambient; inlet totalPressure BC drives the gradient
+            t_init = t0  # Start near stagnation temperature
             u_init = _M0 * _math.sqrt(gamma_cf * _R * t_init)
         mode = str(self.solverConfig.get("dimension", "2d_planar"))
         is_2d = mode == "2d_planar"
