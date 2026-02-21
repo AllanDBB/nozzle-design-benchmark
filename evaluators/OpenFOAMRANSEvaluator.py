@@ -145,13 +145,15 @@ divSchemes
 {
     default         none;
 
-    div(phi,U)      bounded Gauss upwind;
+    div(phi,U)      Gauss upwind;
+    div(phid,p)     Gauss limitedLinear 1;
 
-    energy          bounded Gauss upwind;
-    div(phi,h)      $energy;
-    div(phi,K)      $energy;
+    energy              Gauss limitedLinear 1;
+    div(phi,h)          $energy;
+    div(phi,K)          $energy;
+    div(phi,(p|rho))    Gauss limitedLinear 1;
 
-    turbulence      bounded Gauss upwind;
+    turbulence      Gauss upwind;
     div(phi,k)      $turbulence;
     div(phi,epsilon) $turbulence;
 
@@ -192,27 +194,35 @@ wallDist
 
 solvers
 {{
-    p
+    "rho.*"
     {{
-        solver          GAMG;
-        smoother        GaussSeidel;
-        tolerance       1e-8;
-        relTol          0.01;
+        solver          diagonal;
     }}
 
-    "(U|h|k|epsilon)"
+    "p.*"
+    {{
+        solver          smoothSolver;
+        smoother        symGaussSeidel;
+        tolerance       1e-7;
+        relTol          0;
+    }}
+
+    "(U|h|k|epsilon).*"
     {{
         solver          PBiCGStab;
         preconditioner  DILU;
-        tolerance       1e-10;
+        tolerance       1e-7;
         relTol          0.1;
     }}
 }}
 
 PIMPLE
 {{
-    // pRefCell/pRefValue anchor the absolute pressure level so that
-    // a zeroGradient supersonic outlet does not leave the matrix singular.
+    transonic           yes;
+    nOuterCorrectors    2;
+    nCorrectors         1;
+    nNonOrthogonalCorrectors 0;
+
     pRefCell    0;
     pRefValue   {pa};
 
@@ -222,8 +232,6 @@ PIMPLE
         U               1e-5;
         "(h|k|epsilon)" 1e-5;
     }}
-
-    nNonOrthogonalCorrectors 2;
 }}
 
 relaxationFactors
@@ -236,7 +244,7 @@ relaxationFactors
     equations
     {{
         U       0.3;
-        h       0.15;
+        h       0.1;
         k       0.2;
         epsilon 0.2;
     }}
@@ -256,7 +264,7 @@ relaxationFactors
 limitp
 {
     type    limitPressure;
-    min     100;
+    min     1000;
     max     1e8;
 }
 
@@ -525,7 +533,14 @@ internalField uniform {p_init};
 boundaryField
 {{
     inlet {{ type totalPressure; p0 uniform {p0}; gamma 1.4; value uniform {p_init}; }}
-    outlet {{ type zeroGradient; }}
+    outlet {{
+        type            waveTransmissive;
+        field           p;
+        gamma           1.4;
+        fieldInf        {pa};
+        lInf            0.5;
+        value           uniform {pa};
+    }}
     upperWall {{ type zeroGradient; }}
     lowerWall {{ type zeroGradient; }}
     front {{ type {front_p}; }}
