@@ -146,7 +146,6 @@ divSchemes
     default         none;
 
     div(phi,U)      bounded Gauss upwind;
-    div(phid,p)     Gauss upwind;
 
     energy          bounded Gauss upwind;
     div(phi,h)      $energy;
@@ -192,10 +191,10 @@ wallDist
 
 solvers
 {
-    "(p|phid)"
+    p
     {
-        solver          PBiCGStab;
-        preconditioner  DILU;
+        solver          GAMG;
+        smoother        DIC;
         tolerance       1e-8;
         relTol          0.01;
     }
@@ -211,8 +210,6 @@ solvers
 
 PIMPLE
 {
-    transonic       yes;
-
     residualControl
     {
         p               1e-4;
