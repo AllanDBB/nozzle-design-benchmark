@@ -15,7 +15,7 @@ from typing import Dict, Any
 from analysis import AnalysisNote, generate_comparison_plots, generate_optimization_plots
 from benchmarks import BenchmarkSuite
 from evaluators import CFDSimulation, OpenFOAMRANSEvaluator, EvaluationResult
-from geometry import MOCSolver, NozzleGeometry
+from geometry import MOCSolver, NozzleGeometry, MinimumLengthNozzle
 from optimization import Optimizer, OptimizationRunner
 
 
@@ -271,6 +271,16 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     _log(f"MOC geometry generated  |  Me={moc_cfg['mach_exit']}  throat={moc_cfg['geometry']['throat_y']*1000:.1f} mm", t0)
     moc_geometry.exportGeo(str(moc_dir / "moc_geometry.csv"))
     moc_geometry.plotProfile(str(moc_dir / "moc_geometry.png"))
+
+    # MLN-specific plot: 2-panel geometry + wall-angle distribution.
+    _mln = MinimumLengthNozzle.from_params(
+        moc_cfg["geometry"],
+        mach_exit=float(moc_cfg["mach_exit"]),
+        gamma=float(moc_cfg.get("gamma", 1.4)),
+    )
+    _mln.plot(str(moc_dir / "mln_geometry.png"))
+
+    # MOC 2-D planar isentropic characteristic network.
     moc_solver.plotCharacteristics(moc_geometry, str(moc_dir / "moc_characteristics.png"))
 
     # 2) Optimize parametrized geometry using CFD-like evaluator.
