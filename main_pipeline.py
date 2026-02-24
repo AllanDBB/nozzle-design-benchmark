@@ -1,8 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
+import datetime as dt
 import importlib.util
 import json
+import random
+import subprocess
 import sys
 import threading
 import time
@@ -51,12 +54,34 @@ def default_config() -> Dict[str, Any]:
         },
         "evaluator": {
             "backend": "openfoam",
+            "campaign": "design_supersonic",
             "gamma": 1.4,
             "stagnation_temperature": 1000.0,
             "stagnation_pressure": 6.0e5,
             "ambient_pressure": 8.0e4,
             "n_samples": 90,
             "fallback_on_failure": False,
+            "require_rans_converged": True,
+            "require_converged_series": True,
+            "allow_unsteady_overexpanded": True,
+            "use_window_averages_overexpanded": True,
+            "min_writes": 8,
+            "convergence_window": 5,
+            "convergence_tol": {
+                "p_out_rel_std": 0.02,
+                "mdot_rel_std": 0.02,
+                "ux_out_rel_std": 0.03,
+            },
+            "overexpanded_unsteady_tol": {
+                "p_out_rel_std_max": 0.20,
+                "mdot_rel_std_max": 0.80,
+                "ux_out_rel_std_max": 1.20,
+            },
+            "enable_delta_t_abort": True,
+            "delta_t_abort_threshold": 1e-80,
+            "delta_t_abort_streak": 20,
+            "outlet_bc_mode": "wave_transmissive",
+            "sampling_nx": 81,
             "friction_scale": 0.2,
             "cf_multiplier": 1.0,
             "curvature_scale": 0.05,
@@ -67,11 +92,13 @@ def default_config() -> Dict[str, Any]:
             "divergence_scale": 1.0,
             "dimension": "2d_planar",
             "depth": 0.02,
-            "mesh_nx": 180,
-            "mesh_ny": 80,
+            "mesh_nx": 120,
+            "mesh_ny": 54,
             "mesh_nz": 12,
-            "end_time": 1500,
-            "write_interval": 300,
+            "end_time": 0.004,
+            "write_interval": 0.0004,
+            "max_co": 0.3,
+            "delta_t_init": 1e-7,
             "inlet_velocity": 20.0,
             "k_inlet": 1.0,
             "epsilon_inlet": 50.0,
@@ -82,6 +109,7 @@ def default_config() -> Dict[str, Any]:
             "use_gpu": False,
         },
         "optimization": {
+            "strategy": "single_fidelity",
             "algorithm": "random",
             "seed": 42,
             "bounds": {
@@ -99,6 +127,14 @@ def default_config() -> Dict[str, Any]:
             "use_pareto_knee": False,
             # Parallel workers for population evaluation (1 = sequential).
             "n_workers": 1,
+            "low_fidelity_samples": 300,
+            "high_fidelity_top_k": 24,
+            "objective_terms": {
+                "design_shock_penalty": 0.10,
+                "overexpanded_instability_penalty": 0.05,
+                "overexpanded_outlet_osc_penalty": 0.05,
+                "overexpanded_wall_rms_penalty": 0.03,
+            },
         },
     }
 
@@ -124,6 +160,84 @@ def _log(msg: str, t0: float) -> None:
     print(f"{tag}  {msg}", flush=True)
 
 
+def _git_sha() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+    except Exception:
+        return "unknown"
+
+
+def _write_run_meta(out_dir: Path, config: Dict[str, Any], backend: str, solver: str) -> None:
+    payload = {
+        "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "git_sha": _git_sha(),
+        "backend": backend,
+        "solver": solver,
+        "config_effective": config,
+    }
+    (out_dir / "run_meta.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _detect_solver_from_case(case_dir: str) -> str:
+    try:
+        p = Path(case_dir)
+        candidates = [p / "log.shockFluid", p / "log.rhoSimpleFoam", p / "log.fluid"]
+        for log in candidates:
+            if not log.exists():
+                continue
+            text = log.read_text(encoding="utf-8", errors="replace")
+            for line in text.splitlines():
+                if "Exec" in line and "-solver" in line:
+                    parts = line.strip().split()
+                    if parts:
+                        return parts[-1]
+            if log.name == "log.shockFluid":
+                return "shockFluid"
+            if log.name == "log.rhoSimpleFoam":
+                return "rhoSimpleFoam"
+            if log.name == "log.fluid":
+                return "fluid"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _uniform_candidates(bounds: Dict[str, Any], n: int, seed: int) -> list[Dict[str, float]]:
+    rng = random.Random(seed)
+    cands: list[Dict[str, float]] = []
+    for _ in range(max(1, n)):
+        row: Dict[str, float] = {}
+        for k, (lo, hi) in bounds.items():
+            row[k] = rng.uniform(float(lo), float(hi))
+        cands.append(row)
+    return cands
+
+
+def _normalized_screen_score(result: EvaluationResult, terms: Dict[str, float], campaign: str) -> float:
+    thrust = max(float(result.thrust), -1.0e30)
+    loss = max(0.0, min(1.0, float(result.pressureLoss)))
+    score = thrust * (1.0 - 0.35 * loss)
+    shock_present = bool((result.shock or {}).get("present", False))
+    if campaign == "design_supersonic" and shock_present:
+        score *= max(0.0, 1.0 - float(terms.get("design_shock_penalty", 0.10)))
+    if campaign == "overexpanded_sea_level":
+        x_std = (result.shock or {}).get("x_std")
+        if x_std is not None:
+            score *= max(0.0, 1.0 - float(terms.get("overexpanded_instability_penalty", 0.05)) * min(1.0, float(x_std) / 0.05))
+        conv_metrics = (result.convergence or {}).get("metrics", {})
+        if isinstance(conv_metrics, dict):
+            osc_index = max(
+                float(conv_metrics.get("p_out_rel_std", 0.0)) / 0.02,
+                float(conv_metrics.get("mdot_rel_std", 0.0)) / 0.02,
+                float(conv_metrics.get("ux_out_rel_std", 0.0)) / 0.03,
+            )
+            score *= max(0.0, 1.0 - float(terms.get("overexpanded_outlet_osc_penalty", 0.05)) * min(1.0, osc_index))
+            wall_rel = conv_metrics.get("wall_p_rel_rms", result.metadata.get("wall_pressure_rel_rms"))
+            if wall_rel is not None:
+                score *= max(0.0, 1.0 - float(terms.get("overexpanded_wall_rms_penalty", 0.03)) * min(1.0, float(wall_rel) / 0.05))
+    return score
+
+
 def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.time()
     out_dir = Path(config["out_dir"])
@@ -138,9 +252,11 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     n_cands = config.get("optimization", {}).get("n_samples", "?")
     algorithm = config.get("optimization", {}).get("algorithm", "?")
     _log(f"Pipeline START  |  backend={backend}  algorithm={algorithm}  n_samples={n_cands}", t0)
-    _log(f"Output → {out_dir.resolve()}", t0)
+    _log(f"Output -> {out_dir.resolve()}", t0)
+    solver_name = "shockFluid" if backend == "openfoam" else "quasi1d"
+    _write_run_meta(out_dir, config, backend=backend, solver=solver_name)
     if backend == "openfoam":
-        _log("⚑  OpenFOAM RANS mode — each candidate will run shockFluid (density-based Kurganov) in Docker", t0)
+        _log("OpenFOAM RANS mode - each candidate runs shockFluid (density-based Kurganov) in Docker", t0)
 
     # 1) Generate MOC baseline geometry.
     moc_cfg = config["moc"]
@@ -160,20 +276,34 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     # 2) Optimize parametrized geometry using CFD-like evaluator.
     eval_cfg = dict(config["evaluator"])
     opt_cfg = config["optimization"]
-    require_rans = bool(eval_cfg.get("require_rans_converged", False))
+    require_rans_cfg = bool(eval_cfg.get("require_rans_converged", False))
+    require_rans = require_rans_cfg and str(eval_cfg.get("backend", "quasi1d")).lower() == "openfoam"
+    eval_cfg["design_pressure_ratio"] = float(moc_cfg.get("pressure_ratio", 0.10))
 
-    if require_rans and str(eval_cfg.get("backend", "openfoam")).lower() != "openfoam":
-        raise ValueError("require_rans_converged=true requires evaluator.backend='openfoam'")
+    if require_rans_cfg and str(eval_cfg.get("backend", "quasi1d")).lower() != "openfoam":
+        require_rans = False
 
     def is_rans_converged(result: EvaluationResult) -> bool:
-        return str(result.metadata.get("backend", "")).lower() == "openfoam_rans"
+        if str(result.metadata.get("backend", "")).lower() != "openfoam_rans":
+            return False
+        if bool(eval_cfg.get("require_converged_series", True)):
+            conv = result.convergence or {}
+            campaign = str(eval_cfg.get("campaign", "")).lower()
+            if campaign == "overexpanded_sea_level" and bool(eval_cfg.get("allow_unsteady_overexpanded", True)):
+                return bool(conv.get("series_usable", conv.get("converged_series", False)))
+            return bool(conv.get("converged_series", False))
+        return True
 
     def make_evaluator(geometry: NozzleGeometry):
         backend = str(eval_cfg.get("backend", "quasi1d")).lower()
         if backend == "openfoam":
             # Inject mach_exit from MOC config so shockFluid can hot-start at
             # the correct supersonic IC rather than having to guess from geometry.
-            cfg_with_mach = {**eval_cfg, "mach_exit": float(moc_cfg.get("mach_exit", 2.3))}
+            cfg_with_mach = {
+                **eval_cfg,
+                "mach_exit": float(moc_cfg.get("mach_exit", 2.3)),
+                "pressure_ratio": float(moc_cfg.get("pressure_ratio", 0.10)),
+            }
             return OpenFOAMRANSEvaluator(geometry=geometry, solverConfig=cfg_with_mach, resultPath=str(out_dir))
         return CFDSimulation(geometry=geometry, solverConfig=eval_cfg, resultPath=str(out_dir))
 
@@ -226,20 +356,56 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
                 metadata={"status": "failed", "error": str(exc), "params": dict(param_dict)},
             )
 
+    strategy = str(opt_cfg.get("strategy", "single_fidelity")).lower()
+    search_space = {k: v for k, v in opt_cfg.items() if k not in ("algorithm", "seed")}
+    search_space["campaign"] = str(eval_cfg.get("campaign", "")).lower()
+    search_space["objective_terms"] = dict(opt_cfg.get("objective_terms", {}))
     optimizer = Optimizer(
-        searchSpace={k: v for k, v in opt_cfg.items() if k not in ("algorithm", "seed")},
+        searchSpace=search_space,
         objectiveFunc=objective,
         algorithm=str(opt_cfg.get("algorithm", "ga")),
         seed=int(opt_cfg.get("seed", 42)),
     )
-    _log(f"Optimization START  |  {n_cands} candidates  backend={backend}", t0)
     runner = OptimizationRunner(optimizer=optimizer, evaluator=evaluator, historyPath=str(opt_dir / "optimization_history.json"))
-    runner.start()
-    runner.saveHistory()
-    _log(f"Optimization DONE   |  evaluated {len(optimizer._history)} candidates", t0)
 
-    # ── Multi-objective ranking (Pareto analysis on full history) ──────────
-    _log("Running Pareto / multi-objective ranking…", t0)
+    if strategy == "multifidelity_screen":
+        bounds = dict(opt_cfg.get("bounds", {}))
+        low_n = int(opt_cfg.get("low_fidelity_samples", 300))
+        high_k = int(opt_cfg.get("high_fidelity_top_k", 24))
+        seed = int(opt_cfg.get("seed", 42))
+        campaign = str(eval_cfg.get("campaign", "")).lower()
+        terms = dict(opt_cfg.get("objective_terms", {}))
+        low_cfg = dict(eval_cfg)
+        low_cfg["backend"] = "quasi1d"
+        low_candidates = _uniform_candidates(bounds=bounds, n=low_n, seed=seed)
+        _log(f"Optimization START  |  strategy=multifidelity_screen  low={len(low_candidates)}  high_top_k={high_k}", t0)
+
+        scored: list[tuple[float, Dict[str, float]]] = []
+        for i, p in enumerate(low_candidates):
+            gid = f"screen_candidate_{i:05d}"
+            geom = build_geometry_from_params(p, throat, n_points, profile, gid)
+            r_low = CFDSimulation(geometry=geom, solverConfig=low_cfg, resultPath=str(out_dir)).extractResults()
+            scored.append((_normalized_screen_score(r_low, terms=terms, campaign=campaign), p))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        selected_params = [dict(p) for _, p in scored[: max(1, min(high_k, len(scored)))]]
+
+        high_results: list[EvaluationResult] = []
+        for p in selected_params:
+            high_results.append(objective(p))
+
+        optimizer._history = high_results
+        optimizer._history_params = selected_params
+        runner.bestResult = optimizer._history[optimizer._best_idx()] if optimizer._history else None
+        runner.saveHistory()
+        _log(f"Optimization DONE   |  evaluated high-fidelity {len(optimizer._history)} candidates", t0)
+    else:
+        _log(f"Optimization START  |  {n_cands} candidates  backend={backend}", t0)
+        runner.start()
+        runner.saveHistory()
+        _log(f"Optimization DONE   |  evaluated {len(optimizer._history)} candidates", t0)
+
+    #  Multi-objective ranking (Pareto analysis on full history) 
+    _log("Running Pareto / multi-objective ranking", t0)
     mo_summary: Dict[str, Any] = {}
     if _run_multiobjective is not None and len(optimizer._history) > 1:
         history_records = []
@@ -257,9 +423,9 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as _exc:
             mo_summary = {"error": str(_exc)}
 
-    # ── Select best candidate ──────────────────────────────────────────────
+    #  Select best candidate 
     selected_idx: int
-    use_pareto_knee = bool(opt_cfg.get("use_pareto_knee", False))
+    use_pareto_knee = bool(opt_cfg.get("use_pareto_knee", strategy == "multifidelity_screen"))
     if require_rans:
         valid_idxs = [i for i, r in enumerate(optimizer._history) if is_rans_converged(r)]
         if not valid_idxs:
@@ -282,13 +448,19 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     optimized_geometry.plotProfile(str(opt_dir / "optimized_geometry.png"))
 
     # 3) Benchmark MOC vs optimized with same evaluator.
-    _log("Benchmark START  |  evaluating MOC and optimized geometry…", t0)
+    _log("Benchmark START  |  evaluating MOC and optimized geometry", t0)
     bench_eval = make_evaluator(moc_geometry)
     suite = BenchmarkSuite(mocGeometry=moc_geometry, optimizedGeometry=optimized_geometry, evaluator=bench_eval)
     comparison: Dict[str, Any]
     benchmark_error = ""
     try:
         suite.runAll()
+        if backend == "openfoam" and suite.mocResult is not None:
+            case_dir = str((suite.mocResult.metadata or {}).get("case_dir", ""))
+            detected = _detect_solver_from_case(case_dir)
+            if detected != "unknown":
+                solver_name = detected
+                _write_run_meta(out_dir, config, backend=backend, solver=solver_name)
         if require_rans:
             if suite.mocResult is None or suite.optResult is None:
                 raise RuntimeError("Benchmark results missing.")
@@ -351,6 +523,20 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     note.addMetric("optimizer_evaluations", len(optimizer._history))
     note.addMetric("best_parameters", best_params)
     note.addMetric("selected_candidate_index", selected_idx)
+    if optimizer._history:
+        thrust_vals = [float(r.thrust) for r in optimizer._history]
+        loss_vals = [float(r.pressureLoss) for r in optimizer._history]
+        note.addMetric("thrust_mean", sum(thrust_vals) / len(thrust_vals))
+        note.addMetric("pressure_loss_mean", sum(loss_vals) / len(loss_vals))
+        shock_x_vals = [float(r.shock.get("x")) for r in optimizer._history if isinstance(r.shock, dict) and r.shock.get("x") is not None]
+        if shock_x_vals:
+            sx_mean = sum(shock_x_vals) / len(shock_x_vals)
+            sx_var = sum((x - sx_mean) * (x - sx_mean) for x in shock_x_vals) / len(shock_x_vals)
+            note.addMetric("shock_x_mean", sx_mean)
+            note.addMetric("shock_x_std", sx_var ** 0.5)
+        wall_rms_vals = [float((r.metadata or {}).get("wall_pressure_rms")) for r in optimizer._history if (r.metadata or {}).get("wall_pressure_rms") is not None]
+        if wall_rms_vals:
+            note.addMetric("wall_pressure_rms", sum(wall_rms_vals) / len(wall_rms_vals))
     if mo_summary:
         note.addMetric("multiobjective_summary", mo_summary)
 
@@ -388,7 +574,7 @@ def main() -> None:
     cfg = default_config()
 
     if args.config:
-        user_cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        user_cfg = json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
         # shallow merge by sections
         for key, value in user_cfg.items():
             if isinstance(value, dict) and key in cfg and isinstance(cfg[key], dict):
@@ -403,14 +589,14 @@ def main() -> None:
 
     summary = run_pipeline(cfg)
 
-    # ── Formatted results output ──────────────────────────────────────────
+    # Formatted results output
     cmp = summary.get("comparison", {})
     mo  = summary.get("multiobjective", {})
-    sep = "─" * 52
+    sep = "-" * 52
 
     print()
     print(sep)
-    print("  NOZZLE DESIGN BENCHMARK — RESULTS")
+    print("  NOZZLE DESIGN BENCHMARK - RESULTS")
     print(sep)
     print(f"  Status          : {summary.get('status', '?').upper()}")
     print(f"  Elapsed         : {summary.get('elapsed_seconds', 0):.1f} s")
@@ -419,7 +605,7 @@ def main() -> None:
 
     if cmp and cmp.get("status") != "failed":
         print("  PERFORMANCE COMPARISON")
-        print(f"  {'':25s}  {'MOC':>10s}  {'OPT':>10s}  {'Δ':>10s}")
+        print(f"  {'':25s}  {'MOC':>10s}  {'OPT':>10s}  {'d':>10s}")
         moc_t  = cmp.get("moc_thrust", 0)
         opt_t  = cmp.get("optimized_thrust", 0)
         moc_pl = cmp.get("moc_pressure_loss", 0)
@@ -443,10 +629,11 @@ def main() -> None:
         print(f"  Pareto front    : {pf} / {nc} candidates")
         print(sep)
 
-    print(f"  report.md  → {summary.get('out_dir', '')}/report.md")
+    print(f"  report.md  -> {summary.get('out_dir', '')}/report.md")
     print(sep)
     print()
 
 
 if __name__ == "__main__":
     main()
+

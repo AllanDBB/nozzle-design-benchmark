@@ -77,8 +77,10 @@ Los resultados se guardan en `out/<nombre_del_caso>/`, configurado por `out_dir`
 | Archivo | Backend | Duración estimada | Uso |
 |---|---|---|---|
 | `docs/local_quick_test.json` | quasi-1D | ~5 s | Verificación local, sin Docker |
-| `docs/rans_2d_quick.json` | OpenFOAM 2D | ~1-3 h | Test RANS mínimo con Docker |
-| `docs/example_config.json` | OpenFOAM 2D | ~2-5 h | Config completa de referencia |
+| `docs/rans_2d_quick.json` | OpenFOAM 2D | ~10-20 min | Smoke estricto RANS |
+| `docs/design_supersonic.json` | OpenFOAM 2D | ~2-6 h | Campaña de diseño (casi shock-free) |
+| `docs/overexpanded_sea_level.json` | OpenFOAM 2D | ~2-6 h | Campaña sobreexpandida (choque interno) |
+| `docs/rans_2d_nightly_smoke.json` | OpenFOAM 2D | ~15-40 min | Smoke nightly CI |
 
 ### Bloque `moc`
 ```json
@@ -116,7 +118,18 @@ Los resultados se guardan en `out/<nombre_del_caso>/`, configurado por `out_dir`
 | Parámetro | Valores | Descripción |
 |---|---|---|
 | `backend` | `"quasi1d"` / `"openfoam"` | Motor de evaluación |
-| `fallback_on_failure` | `true` / `false` | `true` = si OpenFOAM falla, usa quasi-1D como respaldo. `false` = estricto RANS, aborta si falla |
+| `campaign` | `"design_supersonic"` / `"overexpanded_sea_level"` | Régimen físico objetivo |
+| `fallback_on_failure` | `true` / `false` | Recomendado `false` en campañas oficiales para evitar éxitos falsos |
+| `require_rans_converged` | `true` / `false` | Exige backend OpenFOAM convergido |
+| `require_converged_series` | `true` / `false` | Exige convergencia por serie temporal de salida |
+| `allow_unsteady_overexpanded` | `true` / `false` | En campaña overexpanded acepta series no-estacionarias dentro de límites |
+| `use_window_averages_overexpanded` | `true` / `false` | Usa promedio temporal de ventana para métricas de salida en overexpanded |
+| `min_writes` / `convergence_window` | int | Control de ventana para convergencia temporal |
+| `convergence_tol` | object | Tolerancias relativas de `p_out`, `mdot`, `Ux_out` |
+| `overexpanded_unsteady_tol` | object | Límites máximos de oscilación permitidos en overexpanded |
+| `enable_delta_t_abort` / `delta_t_abort_threshold` / `delta_t_abort_streak` | bool/float/int | Abortado temprano si `deltaT` colapsa en shockFluid |
+| `outlet_bc_mode` | `"wave_transmissive"` / `"fixed_pressure"` | BC de salida según régimen |
+| `sampling_nx` | int | Número de puntos muestreados en línea de centro |
 | `use_gpu` | `true` / `false` | Habilita CuPy para el solver quasi-1D (requiere CuPy instalado) |
 | `dimension` | `"2d_planar"` | Modo de simulación OpenFOAM (solo 2D recomendado) |
 | `mesh_nx` / `mesh_ny` | int | Resolución de malla (afecta tiempo y fidelidad) |
@@ -155,11 +168,24 @@ Los resultados se guardan en `out/<nombre_del_caso>/`, configurado por `out_dir`
 
 | Parámetro | Descripción |
 |---|---|
+| `strategy` | `"single_fidelity"` / `"multifidelity_screen"` |
 | `algorithm` | `"random"` (recomendado para empezar), `"ga"` (evolutivo) |
 | `n_samples` | Número de candidatos a evaluar. ⚠️ Con RANS cada candidato cuesta tiempo real |
+| `low_fidelity_samples` / `high_fidelity_top_k` | Tamaño de screening quasi-1D y shortlist RANS |
+| `objective_terms` | Penalizaciones por choque, oscilación de outlet y RMS de presión de pared |
 | `w_thrust` / `w_pressure_loss` | Pesos del objetivo multi-criterio (thrust maximize, loss minimize) |
 | `use_pareto_knee` | `true` = usar geometría de la rodilla del frente de Pareto como ganadora |
 | `n_workers` | Evaluaciones en paralelo. Con quasi-1D se puede subir (ej. 4). Con RANS dejar en 1 |
+
+Ejemplo de `objective_terms`:
+```json
+"objective_terms": {
+  "design_shock_penalty": 0.10,
+  "overexpanded_instability_penalty": 0.05,
+  "overexpanded_outlet_osc_penalty": 0.05,
+  "overexpanded_wall_rms_penalty": 0.03
+}
+```
 
 ---
 
@@ -183,10 +209,11 @@ Para asegurarse de que todos los resultados sean RANS-convergidos:
 "evaluator": {
   "backend": "openfoam",
   "fallback_on_failure": false,
-  "require_rans_converged": true
+  "require_rans_converged": true,
+  "require_converged_series": true
 }
 ```
-Con `require_rans_converged: true` el pipeline rechazará candidatos que no hayan convergido en OpenFOAM y abortará.
+Con estos flags, el pipeline rechazará candidatos sin convergencia RANS y sin estabilidad temporal en series de salida.
 
 ---
 
@@ -223,7 +250,7 @@ python -c "import cupy; print(cupy.cuda.runtime.runtimeGetVersion())"
 
 Si un caso falla con `"status": "failed"`:
 
-1. Revisar `out/.../openfoam_cases/<id>/log.rhoSimpleFoam` — buscar `FATAL` o `divergence`
+1. Revisar `out/.../openfoam_cases/<id>/log.shockFluid` — buscar `FATAL` o `divergence`
 2. Revisar `out/.../openfoam_cases/<id>/log.checkMesh` — buscar celdas con skewness alta
 
 Ajustes típicos para estabilizar:
@@ -245,7 +272,7 @@ main_pipeline.py          ← único entrypoint
 │
 ├── evaluators/
 │   ├── CFDSimulation.py          ← Solver quasi-1D vectorizado (NumPy/CuPy)
-│   ├── OpenFOAMRANSEvaluator.py  ← Wrapper Docker + rhoSimpleFoam
+│   ├── OpenFOAMRANSEvaluator.py  ← Wrapper Docker + shockFluid + muestreo CFD real
 │   ├── EvaluationResult.py       ← Resultado de evaluación
 │   └── FastEvaluator.py          ← Evaluador heurístico (screening)
 │
@@ -272,11 +299,22 @@ main_pipeline.py          ← único entrypoint
 | Config | Backend | Malla | n_samples | Tiempo estimado |
 |---|---|---|---|---|
 | `local_quick_test.json` | quasi-1D | — | 5 | ~5 s |
-| `rans_2d_quick.json` | OpenFOAM 2D | 80×36 | 3 | ~1-2 h |
-| `example_config.json` | OpenFOAM 2D | 120×50 | 3 | ~2-5 h |
+| `rans_2d_quick.json` | OpenFOAM 2D | 80×36 | 3 | ~10-20 min |
+| `design_supersonic.json` | OpenFOAM 2D | 120×54 | 24 (high-fidelity) | ~2-6 h |
+| `overexpanded_sea_level.json` | OpenFOAM 2D | 160×72 | 24 (high-fidelity) | ~2-6 h |
 
 > Con `n_workers > 1` en quasi-1D el tiempo escala casi linealmente (4 workers ≈ 4× más rápido).  
 > Con OpenFOAM RANS dejar `n_workers: 1` — cada run ocupa todos los cores disponibles.
+
+---
+
+## Criterio de migración a SU2
+
+La migración se recomienda solo si, tras estabilizar este pipeline:
+
+1. La tasa de no-convergencia RANS supera 30%.
+2. La variabilidad run-to-run en thrust supera 3% con misma geometría/config.
+3. No se logra estabilizar o caracterizar el choque en campaña `overexpanded_sea_level`.
 
 ---
 

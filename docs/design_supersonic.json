@@ -1,9 +1,9 @@
 ﻿{
-  "_comment": "Quick 2-D OpenFOAM smoke (strict, shockFluid).",
-  "out_dir": "out/rans_2d_quick",
+  "_comment": "Design-campaign 2-D RANS (shockFluid). Near design pa/p0.",
+  "out_dir": "out/design_supersonic",
   "moc": {
     "mach_exit": 2.3,
-    "pressure_ratio": 0.10,
+    "pressure_ratio": 0.08,
     "gamma": 1.4,
     "geometry": {
       "throat_y": 0.02,
@@ -14,13 +14,11 @@
   },
   "evaluator": {
     "backend": "openfoam",
-    "campaign": "overexpanded_sea_level",
+    "campaign": "design_supersonic",
     "dimension": "2d_planar",
     "fallback_on_failure": false,
     "require_rans_converged": true,
     "require_converged_series": true,
-    "allow_unsteady_overexpanded": true,
-    "use_window_averages_overexpanded": true,
     "min_writes": 8,
     "convergence_window": 5,
     "convergence_tol": {
@@ -28,40 +26,34 @@
       "mdot_rel_std": 0.02,
       "ux_out_rel_std": 0.03
     },
-    "overexpanded_unsteady_tol": {
-      "p_out_rel_std_max": 0.20,
-      "mdot_rel_std_max": 0.80,
-      "ux_out_rel_std_max": 1.20
-    },
-    "enable_delta_t_abort": true,
-    "delta_t_abort_threshold": 1e-80,
-    "delta_t_abort_streak": 20,
-    "outlet_bc_mode": "fixed_pressure",
+    "outlet_bc_mode": "wave_transmissive",
     "sampling_nx": 81,
     "depth": 0.02,
-    "mesh_nx": 80,
-    "mesh_ny": 36,
-    "end_time": 0.0016,
-    "write_interval": 0.0002,
-    "max_co": 0.25,
+    "mesh_nx": 120,
+    "mesh_ny": 54,
+    "end_time": 0.004,
+    "write_interval": 0.0004,
+    "max_co": 0.3,
     "delta_t_init": 1e-7,
     "gamma": 1.4,
     "stagnation_temperature": 900.0,
     "stagnation_pressure": 300000.0,
-    "ambient_pressure": 90000.0,
+    "ambient_pressure": 24000.0,
     "n_samples": 81,
     "use_gpu": false
   },
   "optimization": {
-    "strategy": "single_fidelity",
+    "strategy": "multifidelity_screen",
     "algorithm": "random",
     "seed": 42,
     "bounds": {
-      "exit_radius": [0.055, 0.065],
-      "length": [0.20, 0.26],
-      "shape": [1.5, 2.0]
+      "exit_radius": [0.055, 0.067],
+      "length": [0.20, 0.27],
+      "shape": [1.45, 2.05]
     },
-    "n_samples": 3,
+    "n_samples": 24,
+    "low_fidelity_samples": 300,
+    "high_fidelity_top_k": 24,
     "n_points": 120,
     "profile": "bezier_like",
     "w_thrust": 0.7,

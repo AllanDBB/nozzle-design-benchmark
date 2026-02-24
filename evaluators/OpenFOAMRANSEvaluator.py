@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import math
 import re
 import shutil
@@ -27,6 +27,60 @@ class OpenFOAMRANSEvaluator:
     resultPath: str
     _lastResult: Optional[EvaluationResult] = None
 
+    def _campaign(self) -> str:
+        return str(self.solverConfig.get("campaign", "")).strip().lower()
+
+    def _sampling_nx(self) -> int:
+        return max(8, int(self.solverConfig.get("sampling_nx", 81)))
+
+    def _sampling_x(self) -> List[float]:
+        n = self._sampling_nx()
+        if n <= 1:
+            return [0.0]
+        length = max(float(self.geometry.length), 1e-9)
+        return [i * length / (n - 1) for i in range(n)]
+
+    def _outlet_bc_mode(self) -> str:
+        mode = str(self.solverConfig.get("outlet_bc_mode", "")).strip().lower()
+        if mode:
+            return mode
+
+        campaign = self._campaign()
+        if campaign == "design_supersonic":
+            return "wave_transmissive"
+        if campaign == "overexpanded_sea_level":
+            return "fixed_pressure"
+        return "wave_transmissive"
+
+    def _validate_campaign(self) -> None:
+        campaign = self._campaign()
+        if campaign not in ("", "design_supersonic", "overexpanded_sea_level"):
+            raise ValueError(f"Unsupported evaluator.campaign: {campaign}")
+
+        if campaign == "":
+            return
+
+        p0 = float(self.solverConfig.get("stagnation_pressure", 3.0e5))
+        pa = float(self.solverConfig.get("ambient_pressure", 9.0e4))
+        if p0 <= 0.0:
+            raise ValueError("stagnation_pressure must be > 0")
+        ratio = pa / p0
+
+        # Use MOC config pressure ratio target if provided by pipeline merge.
+        ratio_design = float(self.solverConfig.get("design_pressure_ratio", self.solverConfig.get("pressure_ratio", 0.10)))
+        ratio_design = max(1e-6, ratio_design)
+
+        if campaign == "design_supersonic" and ratio > max(0.2, 1.6 * ratio_design):
+            raise ValueError(
+                f"campaign=design_supersonic incompatible with pa/p0={ratio:.3f}; "
+                f"expected near design ratio ~{ratio_design:.3f}"
+            )
+        if campaign == "overexpanded_sea_level" and ratio <= min(0.2, 1.25 * ratio_design):
+            raise ValueError(
+                f"campaign=overexpanded_sea_level incompatible with pa/p0={ratio:.3f}; "
+                f"expected clearly overexpanded condition above design ratio ~{ratio_design:.3f}"
+            )
+
     def _run_cmd(self, cmd: str, cwd: Path) -> str:
         proc = subprocess.run(
             ["bash", "-lc", f"source /opt/openfoam13/etc/bashrc >/dev/null 2>&1 || true; {cmd}"],
@@ -39,6 +93,81 @@ class OpenFOAMRANSEvaluator:
                 f"OpenFOAM command failed: {cmd}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
             )
         return proc.stdout + proc.stderr
+
+    @staticmethod
+    def _parse_delta_t_from_line(line: str) -> Optional[float]:
+        m = re.search(r"deltaT\s*=\s*([0-9eE+\-\.]+)", line)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+
+    def _update_delta_t_abort_state(self, delta_t: float, streak: int) -> Tuple[int, bool]:
+        if not bool(self.solverConfig.get("enable_delta_t_abort", True)):
+            return streak, False
+        threshold = float(self.solverConfig.get("delta_t_abort_threshold", 1e-80))
+        needed = max(1, int(self.solverConfig.get("delta_t_abort_streak", 20)))
+        if delta_t <= 0.0 or not math.isfinite(delta_t):
+            streak += 1
+        elif delta_t < threshold:
+            streak += 1
+        else:
+            streak = 0
+        return streak, streak >= needed
+
+    def _run_shockfluid(self, case_dir: Path) -> None:
+        cmd = "foamRun -solver shockFluid"
+        log_path = case_dir / "log.shockFluid"
+        proc = subprocess.Popen(
+            ["bash", "-lc", f"source /opt/openfoam13/etc/bashrc >/dev/null 2>&1 || true; {cmd}"],
+            cwd=str(case_dir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+        streak = 0
+        last_dt = None
+        try:
+            with log_path.open("w", encoding="utf-8", errors="replace") as logf:
+                if proc.stdout is None:
+                    raise RuntimeError("Unable to capture shockFluid stdout")
+                for line in proc.stdout:
+                    logf.write(line)
+                    dt = self._parse_delta_t_from_line(line)
+                    if dt is not None:
+                        last_dt = dt
+                        streak, abort_now = self._update_delta_t_abort_state(dt, streak)
+                        if abort_now:
+                            threshold = float(self.solverConfig.get("delta_t_abort_threshold", 1e-80))
+                            needed = max(1, int(self.solverConfig.get("delta_t_abort_streak", 20)))
+                            msg = (
+                                f"Early-abort shockFluid: deltaT < {threshold:.3e} "
+                                f"for {needed} consecutive steps (last deltaT={dt:.3e})"
+                            )
+                            logf.write(f"\n{msg}\n")
+                            logf.flush()
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                                proc.wait(timeout=5)
+                            raise RuntimeError(msg)
+                rc = proc.wait()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+        if rc != 0:
+            extra = f" (last deltaT={last_dt:.3e})" if last_dt is not None else ""
+            raise RuntimeError(
+                f"OpenFOAM command failed: {cmd}{extra}\n"
+                f"Check {log_path} for details."
+            )
 
     def _case_dir(self, gid: str) -> Path:
         case_root = Path(self.resultPath) / "openfoam_cases"
@@ -57,6 +186,8 @@ class OpenFOAMRANSEvaluator:
         write_interval = float(self.solverConfig.get("write_interval", end_time / 5.0))
         max_co = float(self.solverConfig.get("max_co", 0.5))
         dt_init = float(self.solverConfig.get("delta_t_init", 1e-7))
+        xs = self._sampling_x()
+        probe_locations = "\n".join([f"            ({x:.9g} 0 0)" for x in xs])
         txt = f"""FoamFile
 {{
     version 2.0;
@@ -83,7 +214,7 @@ timeFormat      general;
 timePrecision   6;
 runTimeModifiable true;
 
-// Function objects: average outlet scalars and compute mass-flow rate.
+// Function objects: outlet performance, centerline profiles, and wall pressure dynamics.
 functions
 {{
     outletScalars
@@ -121,6 +252,42 @@ functions
         fields          (phi);
         writeFields     false;
     }}
+
+    upperWallPressure
+    {{
+        type            surfaceFieldValue;
+        libs            ("libfieldFunctionObjects.so");
+        writeControl    writeTime;
+        surfaceFormat   none;
+        patch           upperWall;
+        operation       areaAverage;
+        fields          (p);
+        writeFields     false;
+    }}
+
+    lowerWallPressure
+    {{
+        type            surfaceFieldValue;
+        libs            ("libfieldFunctionObjects.so");
+        writeControl    writeTime;
+        surfaceFormat   none;
+        patch           lowerWall;
+        operation       areaAverage;
+        fields          (p);
+        writeFields     false;
+    }}
+
+    centerlineProbes
+    {{
+        type            probes;
+        libs            ("libsampling.so");
+        writeControl    writeTime;
+        fields          (p T U rho);
+        probeLocations
+        (
+{probe_locations}
+        );
+    }}
 }}
 """
         (case_dir / "system" / "controlDict").write_text(txt, encoding="utf-8")
@@ -157,7 +324,8 @@ divSchemes
 {
     default         none;
 
-    turbulence      Gauss limitedLinear 1;
+    // More dissipative bounded upwind helps keep k/omega positive near shocks.
+    turbulence      bounded Gauss upwind;
     div(phi,k)      $turbulence;
     div(phi,omega)  $turbulence;
 
@@ -243,6 +411,27 @@ limitT
     cellZone    all;
     min         50;
     max         5000;
+}
+
+boundK
+{
+    type        bound;
+    field       k;
+    min         1e-10;
+}
+
+boundOmega
+{
+    type        bound;
+    field       omega;
+    min         1e-8;
+}
+
+boundRho
+{
+    type        bound;
+    field       rho;
+    min         1e-4;
 }
 """
         (case_dir / "system" / "fvConstraints").write_text(fc_txt, encoding="utf-8")
@@ -608,9 +797,22 @@ mergePatchPairs();
         k_uniform = k_in
         om_uniform = omega_in
 
-        # lInf: reference length for waveTransmissive acoustic-wave correction
-        # Use the domain x-length (nozzle length) as the reference
+        # lInf: reference length for waveTransmissive acoustic-wave correction.
         l_inf = float(x1_geo - x0_geo)
+        outlet_bc_mode = self._outlet_bc_mode()
+        if outlet_bc_mode == "fixed_pressure":
+            p_outlet_bc = f"""type            fixedValue;
+        value           uniform {pa:.4f};"""
+        elif outlet_bc_mode == "wave_transmissive":
+            p_outlet_bc = f"""type            waveTransmissive;
+        field           p;
+        psi             psi;
+        gamma           {gamma};
+        fieldInf        {pa:.4f};
+        lInf            {l_inf:.6g};
+        value           uniform {pa:.4f};"""
+        else:
+            raise ValueError(f"Unsupported outlet_bc_mode: {outlet_bc_mode}")
 
         p_txt = f"""FoamFile
 {{
@@ -630,13 +832,7 @@ boundaryField
     }}
     outlet
     {{
-        type            waveTransmissive;
-        field           p;
-        psi             psi;
-        gamma           {gamma};
-        fieldInf        {pa:.4f};
-        lInf            {l_inf:.6g};
-        value           uniform {pa:.4f};
+        {p_outlet_bc}
     }}
     upperWall {{ type zeroGradient; }}
     lowerWall {{ type zeroGradient; }}
@@ -841,6 +1037,377 @@ boundaryField
 
         return p_out, u_out, t_out, mdot
 
+    def _parse_postprocessing_series(self, dat_path: Path) -> List[List[float]]:
+        if not dat_path.exists():
+            return []
+        rows: List[List[float]] = []
+        for line in dat_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            clean = raw.replace("(", " ").replace(")", " ")
+            try:
+                rows.append([float(v) for v in clean.split()])
+            except ValueError:
+                continue
+        return rows
+
+    @staticmethod
+    def _latest_postprocessing_file(post_root: Path, name: str) -> Path:
+        d = post_root / name
+        if not d.exists():
+            raise RuntimeError(f"postProcessing/{name} not found")
+        time_dirs = sorted(
+            [p for p in d.iterdir() if p.is_dir()],
+            key=lambda p: float(p.name) if p.name.replace(".", "", 1).isdigit() else 0.0,
+        )
+        if not time_dirs:
+            raise RuntimeError(f"No time directories found in postProcessing/{name}")
+        return time_dirs[-1] / "surfaceFieldValue.dat"
+
+    def _extract_outlet_series(self, case_dir: Path) -> Dict[str, List[float]]:
+        post = case_dir / "postProcessing"
+        scalars = self._parse_postprocessing_series(self._latest_postprocessing_file(post, "outletScalars"))
+        velocity = self._parse_postprocessing_series(self._latest_postprocessing_file(post, "outletVelocity"))
+        massflow = self._parse_postprocessing_series(self._latest_postprocessing_file(post, "outletMassFlow"))
+        if not scalars or not velocity or not massflow:
+            raise RuntimeError("Missing outlet postProcessing series")
+
+        n = min(len(scalars), len(velocity), len(massflow))
+        times: List[float] = []
+        p: List[float] = []
+        t: List[float] = []
+        ux: List[float] = []
+        uy: List[float] = []
+        uz: List[float] = []
+        umag: List[float] = []
+        mdot: List[float] = []
+        for i in range(n):
+            sc = scalars[i]
+            vel = velocity[i]
+            phi = massflow[i]
+            if len(sc) < 3 or len(vel) < 4 or len(phi) < 2:
+                continue
+            times.append(sc[0])
+            p.append(sc[1])
+            t.append(sc[2])
+            ux.append(vel[1])
+            uy.append(vel[2])
+            uz.append(vel[3])
+            umag.append(math.sqrt(vel[1] * vel[1] + vel[2] * vel[2] + vel[3] * vel[3]))
+            mdot.append(abs(phi[1]))
+
+        if not times:
+            raise RuntimeError("Unable to parse outlet postProcessing series")
+        return {"time": times, "p": p, "T": t, "Ux": ux, "Uy": uy, "Uz": uz, "U": umag, "mdot": mdot}
+
+    def _extract_wall_pressure_series(self, case_dir: Path) -> Dict[str, List[float]]:
+        post = case_dir / "postProcessing"
+        upper_rows = self._parse_postprocessing_series(self._latest_postprocessing_file(post, "upperWallPressure"))
+        lower_rows = self._parse_postprocessing_series(self._latest_postprocessing_file(post, "lowerWallPressure"))
+        if not upper_rows or not lower_rows:
+            raise RuntimeError("Missing wall pressure postProcessing series")
+
+        n = min(len(upper_rows), len(lower_rows))
+        times: List[float] = []
+        upper: List[float] = []
+        lower: List[float] = []
+        mean_vals: List[float] = []
+        delta_vals: List[float] = []
+        for i in range(n):
+            up = upper_rows[i]
+            lo = lower_rows[i]
+            if len(up) < 2 or len(lo) < 2:
+                continue
+            t = up[0]
+            p_up = up[1]
+            p_lo = lo[1]
+            times.append(t)
+            upper.append(p_up)
+            lower.append(p_lo)
+            mean_vals.append(0.5 * (p_up + p_lo))
+            delta_vals.append(p_up - p_lo)
+        if not times:
+            raise RuntimeError("Unable to parse wall pressure postProcessing series")
+        return {
+            "time": times,
+            "upper": upper,
+            "lower": lower,
+            "mean": mean_vals,
+            "delta": delta_vals,
+        }
+
+    def _parse_probe_scalar_file(self, path: Path) -> Tuple[List[float], List[List[float]]]:
+        if not path.exists():
+            return [], []
+        times: List[float] = []
+        values: List[List[float]] = []
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            parts = raw.split()
+            if len(parts) < 2:
+                continue
+            try:
+                t = float(parts[0])
+                vals = [float(v) for v in parts[1:]]
+            except ValueError:
+                continue
+            times.append(t)
+            values.append(vals)
+        return times, values
+
+    def _parse_probe_vector_file(self, path: Path) -> Tuple[List[float], List[List[Tuple[float, float, float]]]]:
+        if not path.exists():
+            return [], []
+        times: List[float] = []
+        rows: List[List[Tuple[float, float, float]]] = []
+        vec_re = re.compile(r"\(([^()]+)\)")
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            head = raw.split(maxsplit=1)
+            if len(head) < 2:
+                continue
+            try:
+                t = float(head[0])
+            except ValueError:
+                continue
+            vecs: List[Tuple[float, float, float]] = []
+            for m in vec_re.finditer(head[1]):
+                nums = m.group(1).split()
+                if len(nums) != 3:
+                    continue
+                try:
+                    vecs.append((float(nums[0]), float(nums[1]), float(nums[2])))
+                except ValueError:
+                    continue
+            if vecs:
+                times.append(t)
+                rows.append(vecs)
+        return times, rows
+
+    def _extract_centerline_series(self, case_dir: Path) -> Dict[str, Any]:
+        root = case_dir / "postProcessing" / "centerlineProbes" / "0"
+        if not root.exists():
+            raise RuntimeError("centerlineProbes output not found")
+        times_p, p_rows = self._parse_probe_scalar_file(root / "p")
+        times_t, t_rows = self._parse_probe_scalar_file(root / "T")
+        times_rho, rho_rows = self._parse_probe_scalar_file(root / "rho")
+        times_u, u_rows = self._parse_probe_vector_file(root / "U")
+        if not times_p or not times_t or not times_u:
+            raise RuntimeError("centerline probe files are incomplete")
+
+        n = min(len(times_p), len(times_t), len(times_rho) if times_rho else len(times_p), len(times_u))
+        gamma = float(self.solverConfig.get("gamma", 1.4))
+        r = float(self.solverConfig.get("gas_constant", 287.0))
+        xs = self._sampling_x()
+        n_probe = len(xs)
+
+        series: List[Dict[str, Any]] = []
+        for i in range(n):
+            p_vals = p_rows[i][:n_probe]
+            t_vals = t_rows[i][:n_probe]
+            rho_vals = rho_rows[i][:n_probe] if rho_rows else [0.0] * len(p_vals)
+            u_vecs = u_rows[i][:n_probe]
+            if not p_vals or not t_vals or not u_vecs:
+                continue
+            ux = [v[0] for v in u_vecs]
+            uy = [v[1] for v in u_vecs]
+            uz = [v[2] for v in u_vecs]
+            umag = [math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) for v in u_vecs]
+            mach = []
+            for u_i, t_i in zip(umag, t_vals):
+                a_i = math.sqrt(max(gamma * r * max(t_i, 1e-9), 1e-9))
+                mach.append(u_i / max(a_i, 1e-9))
+            series.append(
+                {
+                    "time": times_p[i],
+                    "p": p_vals,
+                    "T": t_vals,
+                    "rho": rho_vals,
+                    "Ux": ux,
+                    "Uy": uy,
+                    "Uz": uz,
+                    "U": umag,
+                    "Mach": mach,
+                }
+            )
+        if not series:
+            raise RuntimeError("No usable centerline probe samples")
+        return {"x": xs, "series": series}
+
+    @staticmethod
+    def _rel_std(values: List[float]) -> float:
+        if len(values) < 2:
+            return 1.0
+        mean = sum(values) / len(values)
+        if abs(mean) < 1e-12:
+            return 1.0
+        var = sum((v - mean) * (v - mean) for v in values) / len(values)
+        return math.sqrt(max(var, 0.0)) / abs(mean)
+
+    @staticmethod
+    def _std(values: List[float]) -> float:
+        if len(values) < 2:
+            return 0.0
+        mean = sum(values) / len(values)
+        var = sum((v - mean) * (v - mean) for v in values) / len(values)
+        return math.sqrt(max(var, 0.0))
+
+    @staticmethod
+    def _window_mean(values: List[float], window: int) -> float:
+        if not values:
+            return 0.0
+        w = max(1, min(int(window), len(values)))
+        tail = values[-w:]
+        return sum(tail) / len(tail)
+
+    def _compute_wall_pressure_metrics(self, wall: Dict[str, List[float]]) -> Dict[str, float]:
+        n = len(wall.get("time", []))
+        if n < 2:
+            return {}
+        window = max(2, int(self.solverConfig.get("convergence_window", 5)))
+        w = min(window, n)
+        p_mean = wall.get("mean", [])[-w:]
+        p_delta = wall.get("delta", [])[-w:]
+        rms = self._std(p_mean)
+        rel_rms = self._rel_std(p_mean)
+        delta_rms = self._std(p_delta)
+        return {
+            "wall_p_rms": rms,
+            "wall_p_rel_rms": rel_rms,
+            "wall_p_delta_rms": delta_rms,
+            "wall_p_window": w,
+        }
+
+    def _compute_series_convergence(self, outlet: Dict[str, List[float]]) -> Dict[str, Any]:
+        n = len(outlet.get("time", []))
+        min_writes = max(2, int(self.solverConfig.get("min_writes", 8)))
+        window = max(2, int(self.solverConfig.get("convergence_window", 5)))
+        conv_tol = self.solverConfig.get("convergence_tol", {})
+        tol_p = float(conv_tol.get("p_out_rel_std", 0.02))
+        tol_mdot = float(conv_tol.get("mdot_rel_std", 0.02))
+        tol_ux = float(conv_tol.get("ux_out_rel_std", 0.03))
+        if n < min_writes:
+            return {
+                "converged_series": False,
+                "n_writes": n,
+                "min_writes": min_writes,
+                "window": window,
+                "reason": "not_enough_writes",
+                "metrics": {},
+            }
+
+        w = min(window, n)
+        p_rel = self._rel_std(outlet["p"][-w:])
+        mdot_rel = self._rel_std(outlet["mdot"][-w:])
+        ux_rel = self._rel_std(outlet["Ux"][-w:])
+        converged_series = (p_rel <= tol_p) and (mdot_rel <= tol_mdot) and (ux_rel <= tol_ux)
+        return {
+            "converged_series": converged_series,
+            "n_writes": n,
+            "min_writes": min_writes,
+            "window": w,
+            "reason": "ok" if converged_series else "window_std_exceeded",
+            "metrics": {
+                "p_out_rel_std": p_rel,
+                "mdot_rel_std": mdot_rel,
+                "ux_out_rel_std": ux_rel,
+            },
+            "tolerances": {
+                "p_out_rel_std": tol_p,
+                "mdot_rel_std": tol_mdot,
+                "ux_out_rel_std": tol_ux,
+            },
+        }
+
+    def _series_gate(self, convergence: Dict[str, Any]) -> Tuple[bool, str]:
+        require = bool(self.solverConfig.get("require_converged_series", True))
+        if not require:
+            return True, "series_requirement_disabled"
+
+        if bool(convergence.get("converged_series", False)):
+            return True, "steady_window"
+
+        campaign = self._campaign()
+        if campaign != "overexpanded_sea_level":
+            return False, str(convergence.get("reason", "window_std_exceeded"))
+
+        if not bool(self.solverConfig.get("allow_unsteady_overexpanded", True)):
+            return False, str(convergence.get("reason", "window_std_exceeded"))
+
+        n_writes = int(convergence.get("n_writes", 0))
+        min_writes = int(convergence.get("min_writes", max(2, int(self.solverConfig.get("min_writes", 8)))))
+        metrics = convergence.get("metrics", {}) if isinstance(convergence.get("metrics", {}), dict) else {}
+        unsteady_tol = self.solverConfig.get("overexpanded_unsteady_tol", {})
+        if not isinstance(unsteady_tol, dict):
+            unsteady_tol = {}
+
+        p_max = float(unsteady_tol.get("p_out_rel_std_max", 0.10))
+        mdot_max = float(unsteady_tol.get("mdot_rel_std_max", 0.35))
+        ux_max = float(unsteady_tol.get("ux_out_rel_std_max", 0.45))
+
+        p_rel = float(metrics.get("p_out_rel_std", 1.0e9))
+        mdot_rel = float(metrics.get("mdot_rel_std", 1.0e9))
+        ux_rel = float(metrics.get("ux_out_rel_std", 1.0e9))
+
+        if n_writes >= min_writes and p_rel <= p_max and mdot_rel <= mdot_max and ux_rel <= ux_max:
+            return True, "accepted_unsteady_overexpanded"
+        return False, "unsteady_overexpanded_exceeds_limits"
+
+    @staticmethod
+    def _detect_shock_from_profile(x_profile: List[float], mach: List[float], pressure: List[float]) -> Dict[str, Any]:
+        n = min(len(x_profile), len(mach), len(pressure))
+        if n < 3:
+            return {"present": False, "x": None, "strength": None}
+        best_idx = -1
+        best_strength = 0.0
+        for i in range(1, n - 1):
+            m_up = 0.5 * (mach[i - 1] + mach[i])
+            m_down = 0.5 * (mach[i] + mach[i + 1])
+            p_up = max(pressure[i - 1], 1e-9)
+            p_down = pressure[i + 1]
+            p_ratio = p_down / p_up
+            if m_up > 1.15 and m_down < 0.95 and p_ratio > 1.15 and p_ratio > best_strength:
+                best_strength = p_ratio
+                best_idx = i
+        if best_idx < 0:
+            return {"present": False, "x": None, "strength": None}
+        return {"present": True, "x": x_profile[best_idx], "strength": best_strength}
+
+    def _compute_shock_series(self, centerline: Dict[str, Any]) -> Dict[str, Any]:
+        x_profile = centerline.get("x", [])
+        series = centerline.get("series", [])
+        shock_x_series: List[float] = []
+        shock_strength_series: List[float] = []
+        for row in series:
+            d = self._detect_shock_from_profile(x_profile, row.get("Mach", []), row.get("p", []))
+            if d["present"] and d["x"] is not None and d["strength"] is not None:
+                shock_x_series.append(float(d["x"]))
+                shock_strength_series.append(float(d["strength"]))
+        final = self._detect_shock_from_profile(
+            x_profile,
+            series[-1].get("Mach", []) if series else [],
+            series[-1].get("p", []) if series else [],
+        )
+        if len(shock_x_series) >= 2:
+            mean_x = sum(shock_x_series) / len(shock_x_series)
+            var_x = sum((x - mean_x) * (x - mean_x) for x in shock_x_series) / len(shock_x_series)
+            x_std = math.sqrt(max(var_x, 0.0))
+        else:
+            x_std = None
+        return {
+            "present": bool(final.get("present", False)),
+            "x": final.get("x"),
+            "strength": final.get("strength"),
+            "x_series": shock_x_series,
+            "strength_series": shock_strength_series,
+            "x_std": x_std,
+        }
+
     def _check_convergence(self, case_dir: Path) -> bool:
         """Return True if shockFluid reached the end of its run without abort."""
         log_path = case_dir / "log.shockFluid"
@@ -871,6 +1438,7 @@ boundaryField
         self._lastResult = self.extractResults()
 
     def extractResults(self) -> EvaluationResult:
+        self._validate_campaign()
         gid = str(self.geometry.metadata.get("id", self.geometry.metadata.get("source", "geometry")))
         case_dir = self._case_dir(gid)
         self._build_case(case_dir)
@@ -878,7 +1446,7 @@ boundaryField
         try:
             self._run_cmd("blockMesh > log.blockMesh 2>&1", case_dir)
             self._run_cmd("checkMesh > log.checkMesh 2>&1", case_dir)
-            self._run_cmd("foamRun -solver shockFluid > log.shockFluid 2>&1", case_dir)
+            self._run_shockfluid(case_dir)
         except Exception as exc:
             if not bool(self.solverConfig.get("fallback_on_failure", False)):
                 raise
@@ -914,7 +1482,8 @@ boundaryField
             return fallback
 
         try:
-            p_out, u_out, t_out, mdot = self._extract_outlet_values(case_dir)
+            outlet = self._extract_outlet_series(case_dir)
+            centerline = self._extract_centerline_series(case_dir)
         except Exception as exc:
             if not bool(self.solverConfig.get("fallback_on_failure", False)):
                 raise
@@ -928,11 +1497,63 @@ boundaryField
             fallback.metadata["case_dir"] = str(case_dir)
             self._lastResult = fallback
             return fallback
+        wall: Dict[str, List[float]] = {}
+        wall_warning = ""
+        try:
+            wall = self._extract_wall_pressure_series(case_dir)
+        except Exception as exc:
+            wall_warning = str(exc)
 
         gamma = float(self.solverConfig.get("gamma", 1.4))
         r = float(self.solverConfig.get("gas_constant", 287.0))
         p0 = float(self.solverConfig.get("stagnation_pressure", 1.5e6))
         pa = float(self.solverConfig.get("ambient_pressure", 1.0e4))
+        require_converged_series = bool(self.solverConfig.get("require_converged_series", True))
+        campaign = self._campaign()
+        use_window_averages = (
+            campaign == "overexpanded_sea_level"
+            and bool(self.solverConfig.get("use_window_averages_overexpanded", True))
+        )
+
+        convergence = self._compute_series_convergence(outlet)
+        wall_metrics = self._compute_wall_pressure_metrics(wall) if wall else {}
+        if wall_metrics:
+            convergence.setdefault("metrics", {}).update(wall_metrics)
+        series_usable, series_gate_reason = self._series_gate(convergence)
+        convergence["series_usable"] = series_usable
+        convergence["series_gate_reason"] = series_gate_reason
+        if not series_usable:
+            msg = f"Series-based acceptance failed for case {gid}: {convergence}"
+            if not bool(self.solverConfig.get("fallback_on_failure", False)):
+                raise RuntimeError(msg)
+            fallback = CFDSimulation(
+                geometry=self.geometry,
+                solverConfig=self.solverConfig,
+                resultPath=self.resultPath,
+            ).extractResults()
+            fallback.metadata["backend"] = "openfoam_fallback"
+            fallback.metadata["convergence_warning"] = msg
+            fallback.metadata["case_dir"] = str(case_dir)
+            self._lastResult = fallback
+            return fallback
+
+        w_avg = int(convergence.get("window", max(2, int(self.solverConfig.get("convergence_window", 5)))))
+        if use_window_averages:
+            p_out = self._window_mean(outlet["p"], w_avg)
+            t_out = self._window_mean(outlet["T"], w_avg)
+            ux_out = self._window_mean(outlet["Ux"], w_avg)
+            uy_out = self._window_mean(outlet["Uy"], w_avg)
+            uz_out = self._window_mean(outlet["Uz"], w_avg)
+            u_out = self._window_mean(outlet["U"], w_avg)
+            mdot = self._window_mean(outlet["mdot"], w_avg)
+        else:
+            p_out = outlet["p"][-1]
+            t_out = outlet["T"][-1]
+            ux_out = outlet["Ux"][-1]
+            uy_out = outlet["Uy"][-1]
+            uz_out = outlet["Uz"][-1]
+            u_out = outlet["U"][-1]
+            mdot = outlet["mdot"][-1]
 
         a = math.sqrt(max(gamma * r * max(t_out, 1e-9), 1e-9))
         m_out = u_out / max(a, 1e-9)
@@ -947,11 +1568,18 @@ boundaryField
             a_exit = math.pi * self.geometry.exit_radius ** 2
         thrust = mdot * u_out + (p_out - pa) * a_exit
 
-        n = int(self.solverConfig.get("n_samples", 60))
-        t0_cfg = float(self.solverConfig.get("stagnation_temperature", 1000.0))
-        mach_profile = [1.0 + (m_out - 1.0) * i / max(n - 1, 1) for i in range(n)]
-        temp_profile = [t0_cfg / (1.0 + 0.5 * (gamma - 1.0) * m * m) for m in mach_profile]
-        pressure_profile = [p0 / (1.0 + 0.5 * (gamma - 1.0) * m * m) ** (gamma / (gamma - 1.0)) for m in mach_profile]
+        final_center = centerline["series"][-1]
+        x_profile = centerline["x"][:]
+        mach_profile = final_center["Mach"][:]
+        temp_profile = final_center["T"][:]
+        pressure_profile = final_center["p"][:]
+        velocity_profile = final_center["U"][:]
+        shock = self._compute_shock_series(centerline)
+        convergence["log_converged"] = converged
+        convergence["require_converged_series"] = require_converged_series
+        convergence["outlet_time"] = outlet["time"][-1]
+        convergence["window_averaged_outlet"] = bool(use_window_averages)
+        convergence["window_averaged_size"] = w_avg if use_window_averages else 1
 
         self._lastResult = EvaluationResult(
             machProfile=mach_profile,
@@ -960,16 +1588,37 @@ boundaryField
             geometryId=gid,
             temperatureProfile=temp_profile,
             pressureProfile=pressure_profile,
+            xProfile=x_profile,
+            velocityProfile=velocity_profile,
+            convergence=convergence,
+            shock=shock,
             metadata={
                 "backend": "openfoam_rans",
                 "converged": converged,
                 "dimension": dimension,
                 "case_dir": str(case_dir),
                 "outlet_pressure": p_out,
+                "outlet_ux": ux_out,
+                "outlet_uy": uy_out,
+                "outlet_uz": uz_out,
                 "outlet_velocity": u_out,
                 "outlet_temperature": t_out,
                 "outlet_mach": m_out,
                 "mass_flow": mdot,
+                "series_writes": len(outlet["time"]),
+                "campaign": campaign or "unspecified",
+                "outlet_bc_mode": self._outlet_bc_mode(),
+                "shock_present": bool(shock.get("present", False)),
+                "shock_x": shock.get("x"),
+                "shock_strength": shock.get("strength"),
+                "shock_x_std": shock.get("x_std"),
+                "series_usable": bool(convergence.get("series_usable", False)),
+                "series_gate_reason": convergence.get("series_gate_reason"),
+                "window_averaged_outlet": bool(use_window_averages),
+                "wall_pressure_rms": wall_metrics.get("wall_p_rms"),
+                "wall_pressure_rel_rms": wall_metrics.get("wall_p_rel_rms"),
+                "wall_pressure_delta_rms": wall_metrics.get("wall_p_delta_rms"),
+                "wall_pressure_warning": wall_warning,
             },
         )
         return self._lastResult

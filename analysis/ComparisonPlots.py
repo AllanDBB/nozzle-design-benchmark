@@ -16,6 +16,12 @@ def _x_from_profile(length: float, n: int) -> List[float]:
     return [i * length / (n - 1) for i in range(n)]
 
 
+def _x_from_result(length: float, profile_len: int, x_profile: List[float]) -> List[float]:
+    if x_profile and len(x_profile) == profile_len:
+        return x_profile
+    return _x_from_profile(length, profile_len)
+
+
 def _velocity_profile(mach: List[float], temp: List[float], gamma: float, gas_constant: float) -> List[float]:
     if not mach or not temp:
         return []
@@ -151,8 +157,8 @@ def generate_comparison_plots(
 
     # 2) Mach profile comparison
     if moc_result.machProfile and optimized_result.machProfile:
-        xmprof = _x_from_profile(moc_geometry.length, len(moc_result.machProfile))
-        xoprof = _x_from_profile(optimized_geometry.length, len(optimized_result.machProfile))
+        xmprof = _x_from_result(moc_geometry.length, len(moc_result.machProfile), moc_result.xProfile)
+        xoprof = _x_from_result(optimized_geometry.length, len(optimized_result.machProfile), optimized_result.xProfile)
         fig_ma, ax_ma = plt.subplots(figsize=(8, 4))
         ax_ma.plot(xmprof, moc_result.machProfile, label="MOC", color="tab:blue")
         ax_ma.plot(xoprof, optimized_result.machProfile, label="OPT", color="tab:orange")
@@ -176,11 +182,11 @@ def generate_comparison_plots(
         plt.close()
 
     # 3) Velocity profile comparison (requested)
-    vm = _velocity_profile(moc_result.machProfile, moc_result.temperatureProfile, gamma, gas_constant)
-    vo = _velocity_profile(optimized_result.machProfile, optimized_result.temperatureProfile, gamma, gas_constant)
+    vm = moc_result.velocityProfile or _velocity_profile(moc_result.machProfile, moc_result.temperatureProfile, gamma, gas_constant)
+    vo = optimized_result.velocityProfile or _velocity_profile(optimized_result.machProfile, optimized_result.temperatureProfile, gamma, gas_constant)
     if vm and vo:
-        xv_m = _x_from_profile(moc_geometry.length, len(vm))
-        xv_o = _x_from_profile(optimized_geometry.length, len(vo))
+        xv_m = _x_from_result(moc_geometry.length, len(vm), moc_result.xProfile)
+        xv_o = _x_from_result(optimized_geometry.length, len(vo), optimized_result.xProfile)
         fig_v, ax_v = plt.subplots(figsize=(8, 4))
         ax_v.plot(xv_m, vm, label="MOC", color="tab:blue")
         ax_v.plot(xv_o, vo, label="OPT", color="tab:orange")
@@ -205,8 +211,8 @@ def generate_comparison_plots(
 
     # 4) Pressure profile comparison
     if moc_result.pressureProfile and optimized_result.pressureProfile:
-        xp_m = _x_from_profile(moc_geometry.length, len(moc_result.pressureProfile))
-        xp_o = _x_from_profile(optimized_geometry.length, len(optimized_result.pressureProfile))
+        xp_m = _x_from_result(moc_geometry.length, len(moc_result.pressureProfile), moc_result.xProfile)
+        xp_o = _x_from_result(optimized_geometry.length, len(optimized_result.pressureProfile), optimized_result.xProfile)
         fig_p, ax_p = plt.subplots(figsize=(8, 4))
         ax_p.plot(xp_m, moc_result.pressureProfile, label="MOC", color="tab:blue")
         ax_p.plot(xp_o, optimized_result.pressureProfile, label="OPT", color="tab:orange")
@@ -232,8 +238,8 @@ def generate_comparison_plots(
 
     # 5) Temperature profile comparison
     if moc_result.temperatureProfile and optimized_result.temperatureProfile:
-        xt_m = _x_from_profile(moc_geometry.length, len(moc_result.temperatureProfile))
-        xt_o = _x_from_profile(optimized_geometry.length, len(optimized_result.temperatureProfile))
+        xt_m = _x_from_result(moc_geometry.length, len(moc_result.temperatureProfile), moc_result.xProfile)
+        xt_o = _x_from_result(optimized_geometry.length, len(optimized_result.temperatureProfile), optimized_result.xProfile)
         fig_t, ax_t = plt.subplots(figsize=(8, 4))
         ax_t.plot(xt_m, moc_result.temperatureProfile, label="MOC", color="tab:blue")
         ax_t.plot(xt_o, optimized_result.temperatureProfile, label="OPT", color="tab:orange")

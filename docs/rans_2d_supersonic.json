@@ -1,9 +1,9 @@
-{
-  "_comment": "Supersonic 2-D RANS (shockFluid). 160x72 mesh; end_time in seconds; adaptive CFL (maxCo=0.5). ~10-25 min per candidate.",
+﻿{
+  "_comment": "Supersonic 2-D RANS strict run (shockFluid).",
   "out_dir": "out/rans_2d_supersonic",
   "moc": {
     "mach_exit": 2.3,
-    "pressure_ratio": 0.10,
+    "pressure_ratio": 0.08,
     "gamma": 1.4,
     "geometry": {
       "throat_y": 0.02,
@@ -14,35 +14,46 @@
   },
   "evaluator": {
     "backend": "openfoam",
+    "campaign": "overexpanded_sea_level",
     "dimension": "2d_planar",
-    "fallback_on_failure": true,
+    "fallback_on_failure": false,
+    "require_rans_converged": true,
+    "require_converged_series": true,
+    "allow_unsteady_overexpanded": true,
+    "use_window_averages_overexpanded": true,
+    "min_writes": 8,
+    "convergence_window": 5,
+    "convergence_tol": {
+      "p_out_rel_std": 0.02,
+      "mdot_rel_std": 0.02,
+      "ux_out_rel_std": 0.03
+    },
+    "overexpanded_unsteady_tol": {
+      "p_out_rel_std_max": 0.20,
+      "mdot_rel_std_max": 0.80,
+      "ux_out_rel_std_max": 1.20
+    },
+    "enable_delta_t_abort": true,
+    "delta_t_abort_threshold": 1e-80,
+    "delta_t_abort_streak": 20,
+    "outlet_bc_mode": "fixed_pressure",
+    "sampling_nx": 81,
     "depth": 0.02,
     "mesh_nx": 160,
     "mesh_ny": 72,
-    "end_time": 0.01,
-    "write_interval": 0.002,
-    "max_co": 0.2,
+    "end_time": 0.006,
+    "write_interval": 0.0006,
+    "max_co": 0.25,
     "delta_t_init": 1e-7,
     "gamma": 1.4,
     "stagnation_temperature": 900.0,
     "stagnation_pressure": 300000.0,
     "ambient_pressure": 90000.0,
-    "n_samples": 80,
-    "friction_scale": 0.2,
-    "cf_multiplier": 1.0,
-    "curvature_scale": 0.05,
-    "bl_displacement_scale": 1.0,
-    "discharge_coefficient": 0.985,
-    "enable_shock_model": true,
-    "shock_trigger_ratio": 0.55,
-    "divergence_scale": 1.0,
-    "inlet_velocity": 10.0,
-    "k_inlet": 0.5,
-    "epsilon_inlet": 10.0,
-    "u_initial": 1.0,
+    "n_samples": 81,
     "use_gpu": false
   },
   "optimization": {
+    "strategy": "single_fidelity",
     "algorithm": "random",
     "seed": 42,
     "bounds": {
@@ -53,9 +64,15 @@
     "n_samples": 3,
     "n_points": 120,
     "profile": "bezier_like",
-    "w_thrust": 1.0,
-    "w_pressure_loss": 0.0,
-    "use_pareto_knee": false,
-    "n_workers": 1
+    "w_thrust": 0.7,
+    "w_pressure_loss": 0.3,
+    "use_pareto_knee": true,
+    "n_workers": 1,
+    "objective_terms": {
+      "design_shock_penalty": 0.10,
+      "overexpanded_instability_penalty": 0.05,
+      "overexpanded_outlet_osc_penalty": 0.05,
+      "overexpanded_wall_rms_penalty": 0.03
+    }
   }
 }

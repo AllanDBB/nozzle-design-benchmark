@@ -15,6 +15,9 @@
   },
   "evaluator": {
     "backend": "quasi1d",
+    "campaign": "design_supersonic",
+    "require_rans_converged": false,
+    "require_converged_series": false,
     "gamma": 1.4,
     "stagnation_temperature": 1000.0,
     "stagnation_pressure": 600000.0,
@@ -32,6 +35,7 @@
     "use_gpu": false
   },
   "optimization": {
+    "strategy": "single_fidelity",
     "algorithm": "random",
     "seed": 42,
     "bounds": {

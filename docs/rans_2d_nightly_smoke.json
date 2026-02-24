@@ -1,9 +1,9 @@
 ﻿{
-  "_comment": "Quick 2-D OpenFOAM smoke (strict, shockFluid).",
-  "out_dir": "out/rans_2d_quick",
+  "_comment": "Nightly smoke: strict OpenFOAM run with 1 optimized candidate.",
+  "out_dir": "out/rans_2d_nightly_smoke",
   "moc": {
     "mach_exit": 2.3,
-    "pressure_ratio": 0.10,
+    "pressure_ratio": 0.08,
     "gamma": 1.4,
     "geometry": {
       "throat_y": 0.02,
@@ -39,11 +39,11 @@
     "outlet_bc_mode": "fixed_pressure",
     "sampling_nx": 81,
     "depth": 0.02,
-    "mesh_nx": 80,
-    "mesh_ny": 36,
-    "end_time": 0.0016,
-    "write_interval": 0.0002,
-    "max_co": 0.25,
+    "mesh_nx": 120,
+    "mesh_ny": 54,
+    "end_time": 0.0024,
+    "write_interval": 0.0003,
+    "max_co": 0.4,
     "delta_t_init": 1e-7,
     "gamma": 1.4,
     "stagnation_temperature": 900.0,
@@ -57,11 +57,11 @@
     "algorithm": "random",
     "seed": 42,
     "bounds": {
-      "exit_radius": [0.055, 0.065],
-      "length": [0.20, 0.26],
-      "shape": [1.5, 2.0]
+      "exit_radius": [0.056, 0.062],
+      "length": [0.21, 0.25],
+      "shape": [1.6, 1.95]
     },
-    "n_samples": 3,
+    "n_samples": 1,
     "n_points": 120,
     "profile": "bezier_like",
     "w_thrust": 0.7,

@@ -12,6 +12,7 @@
   },
   "evaluator": {
     "backend": "openfoam",
+    "campaign": "design_supersonic",
     "dimension": "2d_planar",
     "depth": 0.02,
     "mesh_nx": 120,
@@ -22,6 +23,17 @@
     "max_co": 0.2,
     "delta_t_init": 1e-7,
     "fallback_on_failure": false,
+    "require_rans_converged": true,
+    "require_converged_series": true,
+    "min_writes": 8,
+    "convergence_window": 5,
+    "convergence_tol": {
+      "p_out_rel_std": 0.02,
+      "mdot_rel_std": 0.02,
+      "ux_out_rel_std": 0.03
+    },
+    "outlet_bc_mode": "wave_transmissive",
+    "sampling_nx": 81,
     "inlet_velocity": 20.0,
     "k_inlet": 1.0,
     "epsilon_inlet": 50.0,
@@ -40,6 +52,7 @@
     "divergence_scale": 1.0
   },
   "optimization": {
+    "strategy": "single_fidelity",
     "algorithm": "random",
     "seed": 123,
     "bounds": {

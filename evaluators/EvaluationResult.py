@@ -15,6 +15,10 @@ class EvaluationResult:
     geometryId: str
     temperatureProfile: List[float] = field(default_factory=list)
     pressureProfile: List[float] = field(default_factory=list)
+    xProfile: List[float] = field(default_factory=list)
+    velocityProfile: List[float] = field(default_factory=list)
+    convergence: Dict[str, Any] = field(default_factory=dict)
+    shock: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def compareWith(self, other: "EvaluationResult") -> Dict[str, Any]:

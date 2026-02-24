@@ -1,0 +1,55 @@
+﻿name: nightly-openfoam
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 5 * * *'
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker compose build
+      - name: Run nightly smoke
+        run: docker compose run --rm nozzle python3 main_pipeline.py --config docs/rans_2d_nightly_smoke.json
+      - name: Gate nightly artifacts
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          out = Path('out/rans_2d_nightly_smoke')
+          summary = json.loads((out / 'summary.json').read_text(encoding='utf-8'))
+          if summary.get('status') != 'ok':
+              raise SystemExit('Nightly failed: summary status != ok')
+
+          comp = out / 'comp'
+          moc = json.loads((comp / 'moc_result.json').read_text(encoding='utf-8'))
+          opt = json.loads((comp / 'optimized_result.json').read_text(encoding='utf-8'))
+
+          for label, row in [('moc', moc), ('opt', opt)]:
+              meta = row.get('metadata', {})
+              if str(meta.get('backend', '')).lower() == 'openfoam_fallback':
+                  raise SystemExit(f'Nightly failed: {label} backend is openfoam_fallback')
+              conv = row.get('convergence', {})
+              if not conv.get('series_usable', conv.get('converged_series', False)):
+                  raise SystemExit(f'Nightly failed: {label} series_usable=false')
+              if not row.get('xProfile') or not row.get('pressureProfile'):
+                  raise SystemExit(f'Nightly failed: {label} missing sampled CFD profiles')
+              if meta.get('wall_pressure_rms') is None:
+                  raise SystemExit(f'Nightly failed: {label} missing wall_pressure_rms')
+
+          hist_path = out / 'opt' / 'optimization_history.json'
+          if hist_path.exists():
+              hist = json.loads(hist_path.read_text(encoding='utf-8'))
+              for i, row in enumerate(hist):
+                  if str((row.get('metadata') or {}).get('backend', '')).lower() == 'openfoam_fallback':
+                      raise SystemExit(f'Nightly failed: candidate {i} used openfoam_fallback')
+          PY
+      - name: Upload nightly artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-openfoam-artifacts
+          path: out/rans_2d_nightly_smoke

@@ -42,16 +42,57 @@ class Optimizer:
     def _w_loss(self) -> float:
         return float(self.searchSpace.get("w_pressure_loss", 0.0))
 
-    def _objective_score(self, result: EvaluationResult) -> float:
-        """Weighted score: maximize thrust, minimize pressure loss.
+    @staticmethod
+    def _norm01(value: float, lo: float, hi: float) -> float:
+        if abs(hi - lo) < 1e-12:
+            return 0.5
+        return max(0.0, min(1.0, (value - lo) / (hi - lo)))
 
-        Higher is always better (for consistent parent/best selection).
+    def _objective_score(self, result: EvaluationResult, reference: Optional[List[EvaluationResult]] = None) -> float:
+        """Normalized weighted score: maximize normalized thrust and minimize loss.
+
+        This score is unitless and therefore less sensitive to thrust scale.
         """
+        if result.metadata.get("status") == "failed":
+            return -1.0
+
+        ref = reference if reference is not None else (self._history if self._history else [result])
+        thrust_vals = [float(r.thrust) for r in ref]
+        t_lo = min(thrust_vals)
+        t_hi = max(thrust_vals)
+        thrust_norm = self._norm01(float(result.thrust), t_lo, t_hi)
+        loss_norm = max(0.0, min(1.0, float(result.pressureLoss)))
+
         wt = self._w_thrust()
         wl = self._w_loss()
         total = max(wt + wl, 1e-9)
-        # Normalise pressure loss to [0..1] heuristic: penalise loss contribution.
-        return (wt / total) * result.thrust - (wl / total) * result.pressureLoss * result.thrust
+        score = (wt / total) * thrust_norm + (wl / total) * (1.0 - loss_norm)
+
+        campaign = str(self.searchSpace.get("campaign", "")).lower()
+        terms = self.searchSpace.get("objective_terms", {}) if isinstance(self.searchSpace.get("objective_terms", {}), dict) else {}
+        shock = result.shock if isinstance(result.shock, dict) else {}
+        shock_present = bool(shock.get("present", False) or result.metadata.get("shock_present", False))
+        if campaign == "design_supersonic" and shock_present:
+            score *= max(0.0, 1.0 - float(terms.get("design_shock_penalty", 0.10)))
+        if campaign == "overexpanded_sea_level":
+            x_std = shock.get("x_std", result.metadata.get("shock_x_std"))
+            if x_std is not None:
+                penalty = float(terms.get("overexpanded_instability_penalty", 0.05))
+                score *= max(0.0, 1.0 - penalty * min(1.0, float(x_std) / 0.05))
+            conv_metrics = (result.convergence or {}).get("metrics", {})
+            if isinstance(conv_metrics, dict):
+                osc_index = max(
+                    float(conv_metrics.get("p_out_rel_std", 0.0)) / 0.02,
+                    float(conv_metrics.get("mdot_rel_std", 0.0)) / 0.02,
+                    float(conv_metrics.get("ux_out_rel_std", 0.0)) / 0.03,
+                )
+                osc_penalty = float(terms.get("overexpanded_outlet_osc_penalty", 0.05))
+                score *= max(0.0, 1.0 - osc_penalty * min(1.0, osc_index))
+                wall_rel = conv_metrics.get("wall_p_rel_rms", result.metadata.get("wall_pressure_rel_rms"))
+                if wall_rel is not None:
+                    wall_penalty = float(terms.get("overexpanded_wall_rms_penalty", 0.03))
+                    score *= max(0.0, 1.0 - wall_penalty * min(1.0, float(wall_rel) / 0.05))
+        return score
 
     def _best_idx(self) -> int:
         return max(range(len(self._history)), key=lambda i: self._objective_score(self._history[i]))
@@ -185,7 +226,7 @@ class Optimizer:
             gen_results = self._evaluate_batch(population)
 
             scored: List[Tuple[float, Dict[str, float]]] = [
-                (self._objective_score(r), p) for r, p in zip(gen_results, population)
+                (self._objective_score(r, reference=gen_results), p) for r, p in zip(gen_results, population)
             ]
             scored.sort(key=lambda x: x[0], reverse=True)
             parents = [dict(p) for _, p in scored[:elite]]
@@ -263,4 +304,3 @@ class Optimizer:
             f"pressureLoss: {best.pressureLoss:.5f} | "
             f"geometry={best.geometryId} | params={self._history_params[idx]}"
         )
-

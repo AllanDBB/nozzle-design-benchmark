@@ -35,6 +35,12 @@ class BenchmarkSuite:
         comparison["optimized_thrust"] = self.optResult.thrust
         comparison["moc_pressure_loss"] = self.mocResult.pressureLoss
         comparison["optimized_pressure_loss"] = self.optResult.pressureLoss
+        moc_wall_rms = (self.mocResult.metadata or {}).get("wall_pressure_rms")
+        opt_wall_rms = (self.optResult.metadata or {}).get("wall_pressure_rms")
+        if moc_wall_rms is not None and opt_wall_rms is not None:
+            comparison["moc_wall_pressure_rms"] = moc_wall_rms
+            comparison["optimized_wall_pressure_rms"] = opt_wall_rms
+            comparison["delta_wall_pressure_rms"] = float(opt_wall_rms) - float(moc_wall_rms)
         return comparison
 
     def save(self, outdir: str) -> Dict[str, Any]:

@@ -1,5 +1,6 @@
 matplotlib>=3.8
 numpy>=1.24
+pytest>=8.2
 # Optional GPU acceleration (uncomment or install separately):
 # cupy-cuda12x>=12.0   # CUDA 12.x
 # cupy-cuda11x>=11.0   # CUDA 11.x
