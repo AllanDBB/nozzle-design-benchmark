@@ -36,19 +36,25 @@
   },
   "optimization": {
     "strategy": "single_fidelity",
-    "algorithm": "random",
+    "algorithm": "evolutionary",
     "seed": 42,
     "bounds": {
-      "exit_radius": [0.055, 0.075],
-      "length": [0.20, 0.28],
-      "shape": [1.4, 2.2]
+      "exit_radius": [0.050, 0.075],
+      "length": [0.18, 0.28],
+      "theta_max": [10.0, 38.0],
+      "inflection_frac": [0.15, 0.55],
+      "throat_angle": [1.0, 10.0]
     },
-    "n_samples": 5,
+    "population": 12,
+    "generations": 6,
+    "sigma": 0.15,
+    "sigma_decay": 0.88,
     "n_points": 120,
-    "profile": "bezier_like",
+    "profile": "rao",
+    "seed_moc": true,
     "w_thrust": 1.0,
-    "w_pressure_loss": 0.0,
-    "use_pareto_knee": false,
+    "w_pressure_loss": 0.3,
+    "use_pareto_knee": true,
     "n_workers": 1
   }
 }

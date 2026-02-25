@@ -134,6 +134,49 @@ class NozzleGeometry:
                 throat + (exit_y - throat) * ((x / length) ** shape)
                 for x in xs
             ]
+        elif profile == "rao":
+            # Rao thrust-optimised contour: expansion zone + straightening
+            # zone.  Guarantees zero exit angle (parallel exit flow) by
+            # construction, like a real Rao / MLN design.
+            #
+            # Parameters
+            # ----------
+            # theta_max       max wall half-angle [deg] (default 22)
+            # inflection_frac fraction of length where theta_max occurs (0.35)
+            # throat_angle    initial wall angle at throat [deg]  (3.0)
+            theta_max_deg = float(params.get("theta_max", 22.0))
+            inflect_frac  = max(0.10, min(0.65, float(params.get("inflection_frac", 0.35))))
+            throat_angle_deg = float(params.get("throat_angle", 3.0))
+
+            theta_max = math.radians(theta_max_deg)
+            throat_ang = math.radians(max(0.0, min(throat_angle_deg, 0.9 * theta_max_deg)))
+            x_inflect = inflect_frac * length
+
+            # Build wall angles then integrate y
+            ys = [throat]
+            for i in range(1, n_points):
+                x = xs[i]
+                dx = xs[i] - xs[i - 1]
+                if x <= x_inflect:
+                    # Expansion: angle rises throat_ang -> theta_max (cubic Hermite)
+                    s = x / max(x_inflect, 1e-12)
+                    smooth = s * s * (3.0 - 2.0 * s)
+                    theta = throat_ang + (theta_max - throat_ang) * smooth
+                else:
+                    # Straightening: angle falls theta_max -> 0 (cubic Hermite)
+                    s = (x - x_inflect) / max(length - x_inflect, 1e-12)
+                    smooth = s * s * (3.0 - 2.0 * s)
+                    theta = theta_max * (1.0 - smooth)
+                ys.append(ys[-1] + math.tan(theta) * dx)
+
+            # Scale y to match prescribed exit_radius exactly
+            raw_rise = ys[-1] - throat
+            target_rise = exit_y - throat
+            if abs(raw_rise) > 1e-12:
+                scale = target_rise / raw_rise
+                ys = [throat + (y - throat) * scale for y in ys]
+            # Clamp last point precisely
+            ys[-1] = exit_y
         else:
             raise ValueError(f"Unsupported profile: {profile}")
 
@@ -168,6 +211,42 @@ class NozzleGeometry:
             x1, y1 = self.control_points[i]
             angles.append(math.atan2(y1 - y0, x1 - x0))
         return angles
+
+    def extract_rao_params(self) -> Dict[str, float]:
+        """Estimate Rao-profile parameters from this contour.
+
+        Useful for seeding an optimiser with an existing MOC contour so that
+        the GA starts in the right neighbourhood.
+
+        Returns dict with keys: exit_radius, length, theta_max, inflection_frac,
+        throat_angle.
+        """
+        angles = self.wall_angles()
+        if not angles:
+            return {
+                "exit_radius": self.exit_radius,
+                "length": self.length,
+                "theta_max": 20.0,
+                "inflection_frac": 0.35,
+                "throat_angle": 3.0,
+            }
+        # Find the maximum wall angle and its position
+        max_angle = max(angles)
+        max_idx = angles.index(max_angle)
+        # x position of max angle (midpoint of the segment)
+        x_max = 0.5 * (self.control_points[max_idx][0] + self.control_points[max_idx + 1][0])
+        inflect_frac = x_max / max(self.length, 1e-12)
+        # Throat angle: average of first few segments
+        n_avg = max(1, min(5, len(angles) // 10))
+        throat_angle = math.degrees(sum(angles[:n_avg]) / n_avg)
+
+        return {
+            "exit_radius": self.exit_radius,
+            "length": self.length,
+            "theta_max": round(math.degrees(max_angle), 3),
+            "inflection_frac": round(max(0.10, min(0.65, inflect_frac)), 4),
+            "throat_angle": round(max(0.5, throat_angle), 3),
+        }
 
     def to_dict(self) -> Dict[str, Any]:
         return {

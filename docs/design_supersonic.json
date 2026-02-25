@@ -43,19 +43,26 @@
     "use_gpu": false
   },
   "optimization": {
-    "strategy": "multifidelity_screen",
-    "algorithm": "random",
+    "strategy": "single_fidelity",
+    "algorithm": "evolutionary",
     "seed": 42,
     "bounds": {
-      "exit_radius": [0.055, 0.067],
-      "length": [0.20, 0.27],
-      "shape": [1.45, 2.05]
+      "exit_radius": [0.050, 0.070],
+      "length": [0.18, 0.28],
+      "theta_max": [10.0, 38.0],
+      "inflection_frac": [0.15, 0.55],
+      "throat_angle": [1.0, 10.0]
     },
+    "population": 24,
+    "generations": 12,
+    "sigma": 0.15,
+    "sigma_decay": 0.88,
     "n_samples": 24,
     "low_fidelity_samples": 300,
     "high_fidelity_top_k": 24,
     "n_points": 120,
-    "profile": "bezier_like",
+    "profile": "rao",
+    "seed_moc": true,
     "w_thrust": 0.7,
     "w_pressure_loss": 0.3,
     "use_pareto_knee": true,

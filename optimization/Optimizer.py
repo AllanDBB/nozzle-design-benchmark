@@ -49,25 +49,31 @@ class Optimizer:
         return max(0.0, min(1.0, (value - lo) / (hi - lo)))
 
     def _objective_score(self, result: EvaluationResult, reference: Optional[List[EvaluationResult]] = None) -> float:
-        """Normalized weighted score: maximize normalized thrust and minimize loss.
+        """Physics-based fitness: raw thrust with pressure-loss penalty.
 
-        This score is unitless and therefore less sensitive to thrust scale.
+        score = thrust * (1 - w_loss * pressureLoss)
+
+        This avoids the normalisation instability of the previous approach
+        (where the score depended on the current population range) and
+        keeps the units of thrust [N] so the GA always maximises physical
+        performance.
         """
         if result.metadata.get("status") == "failed":
-            return -1.0
+            return -1e30
 
-        ref = reference if reference is not None else (self._history if self._history else [result])
-        thrust_vals = [float(r.thrust) for r in ref]
-        t_lo = min(thrust_vals)
-        t_hi = max(thrust_vals)
-        thrust_norm = self._norm01(float(result.thrust), t_lo, t_hi)
-        loss_norm = max(0.0, min(1.0, float(result.pressureLoss)))
+        thrust = float(result.thrust)
+        loss = max(0.0, min(1.0, float(result.pressureLoss)))
 
-        wt = self._w_thrust()
         wl = self._w_loss()
-        total = max(wt + wl, 1e-9)
-        score = (wt / total) * thrust_norm + (wl / total) * (1.0 - loss_norm)
+        # Scale so w_pressure_loss=0.3 penalises ~30% of thrust per unit loss.
+        loss_penalty = 1.0 - wl * loss
+        score = thrust * max(loss_penalty, 0.01)
 
+        # Eta_div bonus: reward contours with low exit-angle divergence loss.
+        eta_div = float(result.metadata.get("eta_div", 1.0))
+        score *= max(eta_div, 0.5)
+
+        # Campaign-specific penalties (shocks, oscillation, etc.)
         campaign = str(self.searchSpace.get("campaign", "")).lower()
         terms = self.searchSpace.get("objective_terms", {}) if isinstance(self.searchSpace.get("objective_terms", {}), dict) else {}
         shock = result.shock if isinstance(result.shock, dict) else {}
@@ -218,22 +224,41 @@ class Optimizer:
         pop_size = int(self.searchSpace.get("population", 18))
         generations = int(self.searchSpace.get("generations", 10))
         elite = max(2, int(pop_size * 0.25))
-        sigma = float(self.searchSpace.get("sigma", 0.12))
+        sigma_init = float(self.searchSpace.get("sigma", 0.12))
+        sigma_decay = float(self.searchSpace.get("sigma_decay", 0.85))
+        tournament_k = max(2, min(5, int(self.searchSpace.get("tournament_k", 3))))
 
-        population = [self._sample_uniform(rng) for _ in range(pop_size)]
-        for _ in range(generations):
+        # Build initial population: inject seed candidates first.
+        seed_candidates: List[Dict[str, float]] = list(
+            self.searchSpace.get("seed_candidates", [])
+        )
+        population: List[Dict[str, float]] = []
+        for sc in seed_candidates[:pop_size]:
+            population.append(self._clamp(dict(sc)))
+        # Fill remaining with random samples.
+        while len(population) < pop_size:
+            population.append(self._sample_uniform(rng))
+
+        sigma = sigma_init
+        for gen_idx in range(generations):
             # Evaluate entire generation in one (potentially parallel) batch.
             gen_results = self._evaluate_batch(population)
 
             scored: List[Tuple[float, Dict[str, float]]] = [
-                (self._objective_score(r, reference=gen_results), p) for r, p in zip(gen_results, population)
+                (self._objective_score(r, reference=gen_results), p)
+                for r, p in zip(gen_results, population)
             ]
             scored.sort(key=lambda x: x[0], reverse=True)
             parents = [dict(p) for _, p in scored[:elite]]
 
-            new_pop = parents[:]
+            # Build next generation: elites + offspring via tournament.
+            new_pop = [dict(p) for p in parents]
             while len(new_pop) < pop_size:
-                a, b = rng.sample(parents, 2)
+                # Tournament selection for two parents.
+                pool_a = rng.sample(scored, min(tournament_k, len(scored)))
+                pool_b = rng.sample(scored, min(tournament_k, len(scored)))
+                a = max(pool_a, key=lambda x: x[0])[1]
+                b = max(pool_b, key=lambda x: x[0])[1]
                 child: Dict[str, float] = {}
                 for k in a.keys():
                     alpha = rng.random()
@@ -243,6 +268,8 @@ class Optimizer:
                     child[k] = v
                 new_pop.append(self._clamp(child))
             population = new_pop
+            # Adaptive sigma decay: reduce mutation as the GA converges.
+            sigma = max(0.01, sigma * sigma_decay)
 
     def _run_bayesian_proxy(self, rng: random.Random) -> None:
         # Lightweight trust-region heuristic (not full GP).

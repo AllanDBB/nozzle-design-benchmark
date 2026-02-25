@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import datetime as dt
@@ -110,21 +110,30 @@ def default_config() -> Dict[str, Any]:
         },
         "optimization": {
             "strategy": "single_fidelity",
-            "algorithm": "random",
+            "algorithm": "evolutionary",
             "seed": 42,
             "bounds": {
-                "exit_radius": [0.055, 0.075],
-                "length": [0.20, 0.32],
-                "shape": [1.4, 2.2],
+                "exit_radius": [0.050, 0.080],
+                "length": [0.18, 0.32],
+                "theta_max": [10.0, 40.0],
+                "inflection_frac": [0.15, 0.55],
+                "throat_angle": [1.0, 10.0],
             },
-            "n_samples": 3,
+            "population": 24,
+            "generations": 12,
+            "sigma": 0.15,
+            "sigma_decay": 0.88,
+            "tournament_k": 3,
+            "n_samples": 30,
             "n_points": 180,
-            "profile": "bezier_like",
+            "profile": "rao",
+            # Seed MOC contour into initial population (filled at runtime).
+            "seed_moc": True,
             # Multi-objective weights (thrust maximised, loss minimised).
             "w_thrust": 1.0,
-            "w_pressure_loss": 0.0,
+            "w_pressure_loss": 0.3,
             # Set to true to use Pareto-knee candidate instead of best-score.
-            "use_pareto_knee": False,
+            "use_pareto_knee": True,
             # Parallel workers for population evaluation (1 = sequential).
             "n_workers": 1,
             "low_fidelity_samples": 300,
@@ -140,17 +149,22 @@ def default_config() -> Dict[str, Any]:
 
 
 def build_geometry_from_params(params: Dict[str, float], throat_radius: float, n_points: int, profile: str, gid: str) -> NozzleGeometry:
-    return NozzleGeometry.fromParams(
-        {
-            "throat_radius": throat_radius,
-            "exit_radius": params["exit_radius"],
-            "length": params["length"],
-            "n_points": n_points,
-            "profile": profile,
-            "shape": params.get("shape", 1.8),
-            "metadata": {"id": gid, "source": "OPT"},
-        }
-    )
+    p: Dict[str, Any] = {
+        "throat_radius": throat_radius,
+        "exit_radius": params["exit_radius"],
+        "length": params["length"],
+        "n_points": n_points,
+        "profile": profile,
+        "metadata": {"id": gid, "source": "OPT"},
+    }
+    # Forward profile-specific params.
+    if profile == "rao":
+        p["theta_max"] = params.get("theta_max", 22.0)
+        p["inflection_frac"] = params.get("inflection_frac", 0.35)
+        p["throat_angle"] = params.get("throat_angle", 3.0)
+    else:
+        p["shape"] = params.get("shape", 1.8)
+    return NozzleGeometry.fromParams(p)
 
 
 def _log(msg: str, t0: float) -> None:
@@ -360,6 +374,16 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     search_space = {k: v for k, v in opt_cfg.items() if k not in ("algorithm", "seed")}
     search_space["campaign"] = str(eval_cfg.get("campaign", "")).lower()
     search_space["objective_terms"] = dict(opt_cfg.get("objective_terms", {}))
+
+    # Seed MOC contour into the initial GA population so the optimizer
+    # starts from the known-good baseline instead of purely random guesses.
+    if bool(opt_cfg.get("seed_moc", True)) and profile == "rao":
+        moc_rao_params = moc_geometry.extract_rao_params()
+        _log(f"  MOC seed  |  theta_max={moc_rao_params['theta_max']:.1f} deg  "
+             f"inflect={moc_rao_params['inflection_frac']:.3f}  "
+             f"throat_ang={moc_rao_params['throat_angle']:.1f} deg", t0)
+        search_space.setdefault("seed_candidates", []).append(moc_rao_params)
+
     optimizer = Optimizer(
         searchSpace=search_space,
         objectiveFunc=objective,
@@ -623,7 +647,12 @@ def main() -> None:
         print(f"  Pressure loss   : {best.get('pressureLoss', 0):.4f}")
         print(f"  exit_radius     : {p.get('exit_radius', 0)*1000:.2f} mm")
         print(f"  length          : {p.get('length', 0)*1000:.1f} mm")
-        print(f"  shape           : {p.get('shape', 0):.3f}")
+        if "theta_max" in p:
+            print(f"  theta_max       : {p.get('theta_max', 0):.2f} deg")
+            print(f"  inflection_frac : {p.get('inflection_frac', 0):.4f}")
+            print(f"  throat_angle    : {p.get('throat_angle', 0):.2f} deg")
+        elif "shape" in p:
+            print(f"  shape           : {p.get('shape', 0):.3f}")
         pf = mo.get("pareto_front_size", "?")
         nc = mo.get("n_candidates", "?")
         print(f"  Pareto front    : {pf} / {nc} candidates")
