@@ -1,12 +1,14 @@
 {
+  "_comment": "Example configuration showing all available options.",
   "out_dir": "out/pipeline_custom",
   "moc": {
-    "mach_exit": 2.8,
+    "mach_exit": 2.5,
     "pressure_ratio": 0.07,
+    "gamma": 1.4,
     "geometry": {
       "throat_y": 0.02,
-      "exit_y": 0.07,
-      "length": 0.26,
+      "exit_y": 0.065,
+      "length": 0.24,
       "n_points": 200
     }
   },
@@ -15,57 +17,54 @@
     "campaign": "design_supersonic",
     "dimension": "2d_planar",
     "depth": 0.02,
+    "gamma": 1.4,
+    "gas_constant": 287.0,
+    "stagnation_temperature": 1000.0,
+    "stagnation_pressure": 600000.0,
+    "ambient_pressure": 48000.0,
+    "n_samples": 90,
     "mesh_nx": 120,
-    "mesh_ny": 50,
-    "mesh_nz": 12,
-    "end_time": 0.008,
-    "write_interval": 0.002,
-    "max_co": 0.2,
-    "delta_t_init": 1e-7,
-    "fallback_on_failure": false,
-    "require_rans_converged": true,
-    "require_converged_series": true,
-    "min_writes": 8,
-    "convergence_window": 5,
-    "convergence_tol": {
-      "p_out_rel_std": 0.02,
-      "mdot_rel_std": 0.02,
-      "ux_out_rel_std": 0.03
-    },
+    "mesh_ny": 54,
+    "end_time": 0.005,
+    "write_interval": 0.0005,
+    "max_co": 0.3,
+    "delta_t_init": 1e-07,
+    "fallback_on_failure": true,
     "outlet_bc_mode": "wave_transmissive",
     "sampling_nx": 81,
-    "inlet_velocity": 20.0,
-    "k_inlet": 1.0,
-    "epsilon_inlet": 50.0,
-    "p_initial": 540000.0,
-    "u_initial": 1.0,
-    "t_initial": 1100.0,
-    "stagnation_temperature": 1100.0,
-    "stagnation_pressure": 600000.0,
-    "ambient_pressure": 80000.0,
-    "friction_scale": 1.1,
-    "cf_multiplier": 1.0,
-    "curvature_scale": 0.25,
-    "bl_displacement_scale": 1.2,
-    "discharge_coefficient": 0.98,
-    "enable_shock_model": true,
-    "divergence_scale": 1.0
+    "use_gpu": false
   },
   "optimization": {
-    "strategy": "single_fidelity",
-    "algorithm": "random",
+    "algorithm": "evolutionary",
     "seed": 123,
     "bounds": {
-      "exit_radius": [0.055, 0.075],
-      "length": [0.20, 0.32],
-      "shape": [1.4, 2.2]
+      "exit_radius": [
+        0.05,
+        0.075
+      ],
+      "length": [
+        0.2,
+        0.3
+      ],
+      "shape": [
+        1.3,
+        2.2
+      ]
     },
+    "population": 24,
+    "generations": 10,
+    "sigma": 0.1,
     "n_points": 200,
     "profile": "bezier_like",
-    "n_samples": 3,
-    "w_thrust": 1.0,
-    "w_pressure_loss": 0.0,
-    "use_pareto_knee": false,
-    "n_workers": 1
+    "w_thrust": 0.7,
+    "w_pressure_loss": 0.3,
+    "n_workers": 2,
+    "rans_top_k": 5,
+    "objective_terms": {
+      "design_shock_penalty": 0.1,
+      "overexpanded_instability_penalty": 0.05,
+      "overexpanded_outlet_osc_penalty": 0.05,
+      "overexpanded_wall_rms_penalty": 0.03
+    }
   }
 }

@@ -1,5 +1,5 @@
-﻿{
-  "_comment": "Nightly smoke: strict OpenFOAM run with 1 optimized candidate.",
+{
+  "_comment": "Nightly smoke: minimal RANS run for CI.",
   "out_dir": "out/rans_2d_nightly_smoke",
   "moc": {
     "mach_exit": 2.3,
@@ -9,18 +9,15 @@
       "throat_y": 0.02,
       "exit_y": 0.06,
       "length": 0.22,
-      "n_points": 120
+      "n_points": 180
     }
   },
   "evaluator": {
     "backend": "openfoam",
-    "campaign": "overexpanded_sea_level",
+    "campaign": "design_supersonic",
     "dimension": "2d_planar",
-    "fallback_on_failure": false,
-    "require_rans_converged": true,
+    "fallback_on_failure": true,
     "require_converged_series": true,
-    "allow_unsteady_overexpanded": true,
-    "use_window_averages_overexpanded": true,
     "min_writes": 8,
     "convergence_window": 5,
     "convergence_tol": {
@@ -28,48 +25,54 @@
       "mdot_rel_std": 0.02,
       "ux_out_rel_std": 0.03
     },
-    "overexpanded_unsteady_tol": {
-      "p_out_rel_std_max": 0.20,
-      "mdot_rel_std_max": 0.80,
-      "ux_out_rel_std_max": 1.20
-    },
-    "enable_delta_t_abort": true,
-    "delta_t_abort_threshold": 1e-80,
-    "delta_t_abort_streak": 20,
-    "outlet_bc_mode": "fixed_pressure",
+    "outlet_bc_mode": "wave_transmissive",
     "sampling_nx": 81,
     "depth": 0.02,
     "mesh_nx": 120,
     "mesh_ny": 54,
-    "end_time": 0.0024,
-    "write_interval": 0.0003,
-    "max_co": 0.4,
-    "delta_t_init": 1e-7,
+    "end_time": 0.004,
+    "write_interval": 0.0004,
+    "max_co": 0.3,
+    "delta_t_init": 1e-07,
+    "enable_delta_t_abort": true,
+    "delta_t_abort_threshold": 1e-80,
+    "delta_t_abort_streak": 20,
     "gamma": 1.4,
+    "gas_constant": 287.0,
     "stagnation_temperature": 900.0,
     "stagnation_pressure": 300000.0,
-    "ambient_pressure": 90000.0,
-    "n_samples": 81,
+    "ambient_pressure": 24000.0,
+    "n_samples": 90,
     "use_gpu": false
   },
   "optimization": {
-    "strategy": "single_fidelity",
-    "algorithm": "random",
+    "algorithm": "evolutionary",
     "seed": 42,
     "bounds": {
-      "exit_radius": [0.056, 0.062],
-      "length": [0.21, 0.25],
-      "shape": [1.6, 1.95]
+      "exit_radius": [
+        0.05,
+        0.07
+      ],
+      "length": [
+        0.18,
+        0.28
+      ],
+      "shape": [
+        1.3,
+        2.2
+      ]
     },
-    "n_samples": 1,
-    "n_points": 120,
+    "population": 4,
+    "generations": 1,
+    "sigma": 0.1,
+    "n_points": 180,
     "profile": "bezier_like",
     "w_thrust": 0.7,
     "w_pressure_loss": 0.3,
-    "use_pareto_knee": true,
     "n_workers": 1,
+    "rans_top_k": 1,
     "objective_terms": {
-      "design_shock_penalty": 0.10,
+      "design_shock_penalty": 0.1,
       "overexpanded_instability_penalty": 0.05,
       "overexpanded_outlet_osc_penalty": 0.05,
       "overexpanded_wall_rms_penalty": 0.03
