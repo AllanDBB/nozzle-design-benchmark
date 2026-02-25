@@ -267,19 +267,51 @@ class NozzleGeometry:
         xs = [p[0] for p in self.control_points]
         ys = [p[1] for p in self.control_points]
 
-        plt.figure(figsize=(8, 3.6))
-        plt.plot(xs, ys, label="upper wall")
-        plt.plot(xs, [-y for y in ys], linestyle="--", label="lower wall")
-        plt.axis("equal")
-        plt.xlabel("x [m]")
-        plt.ylabel("y [m]")
-        plt.title("Nozzle Profile (2D planar)")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
+        fig, ax = plt.subplots(figsize=(9, 4))
+
+        # Nozzle interior shading (centreline to wall).
+        ax.fill_between(xs, 0, ys, color="lightskyblue", alpha=0.25, label="nozzle interior")
+
+        # Upper wall contour.
+        ax.plot(xs, ys, color="black", linewidth=1.8, label="wall contour")
+
+        # Centreline.
+        ax.axhline(0.0, color="gray", linewidth=0.8, linestyle="--", alpha=0.6, label="centreline")
+
+        # Mark throat (minimum y).
+        i_throat = min(range(len(ys)), key=lambda i: ys[i])
+        ax.plot(xs[i_throat], ys[i_throat], "ro", markersize=5, zorder=6)
+        ax.annotate(
+            f"throat r={ys[i_throat]*1000:.1f} mm",
+            xy=(xs[i_throat], ys[i_throat]),
+            xytext=(xs[i_throat] + self.length * 0.06, ys[i_throat] + (max(ys) - min(ys)) * 0.18),
+            fontsize=7,
+            arrowprops=dict(arrowstyle="->", color="red", lw=0.8),
+            color="red",
+        )
+
+        # Mark exit.
+        ax.plot(xs[-1], ys[-1], "gs", markersize=5, zorder=6)
+        ax.annotate(
+            f"exit r={ys[-1]*1000:.1f} mm",
+            xy=(xs[-1], ys[-1]),
+            xytext=(xs[-1] - self.length * 0.18, ys[-1] + (max(ys) - min(ys)) * 0.18),
+            fontsize=7,
+            arrowprops=dict(arrowstyle="->", color="green", lw=0.8),
+            color="green",
+        )
+
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("r [m]")
+        ax.set_title("Nozzle Profile — MLN style (upper wall)")
+        ax.set_ylim(bottom=-0.002)
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=7, loc="upper left")
 
         if savepath:
-            plt.tight_layout()
-            plt.savefig(savepath, dpi=180)
-            plt.close()
+            fig.tight_layout()
+            fig.savefig(savepath, dpi=180)
+            plt.close(fig)
         else:
             plt.show()

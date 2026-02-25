@@ -138,18 +138,21 @@ def generate_comparison_plots(
     ym = [p[1] for p in moc_geometry.control_points]
     xo = [p[0] for p in optimized_geometry.control_points]
     yo = [p[1] for p in optimized_geometry.control_points]
+    # Nozzle interior shading (MLN style — upper wall only).
+    ax_g.fill_between(xm, 0, ym, color="tab:blue", alpha=0.08)
+    ax_g.fill_between(xo, 0, yo, color="tab:orange", alpha=0.08)
     # Characteristic lines behind the walls
     _draw_char_lines(ax_g, moc_geometry, mach_exit, gamma, n_lines=16, alpha=0.22, color="tab:blue")
     _draw_char_lines(ax_g, optimized_geometry, mach_exit, gamma, n_lines=16, alpha=0.22, color="tab:orange")
     ax_g.plot(xm, ym, label="MOC", color="tab:blue", linewidth=2.0, zorder=5)
     ax_g.plot(xo, yo, label="OPT", color="tab:orange", linewidth=2.0, zorder=5)
-    ax_g.plot(xm, [-y for y in ym], color="tab:blue", linestyle="--", alpha=0.45, zorder=5)
-    ax_g.plot(xo, [-y for y in yo], color="tab:orange", linestyle="--", alpha=0.45, zorder=5)
+    ax_g.axhline(0.0, color="gray", linewidth=0.8, linestyle="--", alpha=0.5)
     ax_g.set_xlabel("x [m]")
-    ax_g.set_ylabel("y [m]")
-    ax_g.set_title("Geometry Comparison + Characteristic Lines")
+    ax_g.set_ylabel("r [m]")
+    ax_g.set_title("Geometry Comparison + Characteristic Lines (MLN style)")
+    ax_g.set_ylim(bottom=-0.002)
+    ax_g.set_aspect("equal", adjustable="datalim")
     ax_g.grid(True, alpha=0.3)
-    ax_g.axis("equal")
     _legend_unique()
     plt.tight_layout()
     plt.savefig(out / "compare_geometry.png", dpi=180)

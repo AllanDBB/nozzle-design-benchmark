@@ -155,18 +155,20 @@ class MOCSolver:
         n_steps = n_lines * 12
         xs_grid = [i * x_end / n_steps for i in range(n_steps + 1)]
 
-        plt.figure(figsize=(11, 5))
-        # Nozzle walls (upper + lower + centreline).
+        fig, ax = plt.subplots(figsize=(11, 4.5))
+
+        # Nozzle interior shading + upper wall only (MLN style).
         wall_x = [p[0] for p in geometry.control_points]
         wall_y = [p[1] for p in geometry.control_points]
-        plt.plot(wall_x, wall_y, color="black", linewidth=1.5)
-        plt.plot(wall_x, [-y for y in wall_y], color="black", linewidth=1.5)
-        plt.axhline(0.0, color="gray", linewidth=0.8, linestyle="--", alpha=0.5)
+        ax.fill_between(wall_x, 0, wall_y, color="lightskyblue", alpha=0.12)
+        ax.plot(wall_x, wall_y, color="black", linewidth=1.5, label="wall contour")
+        ax.axhline(0.0, color="gray", linewidth=0.8, linestyle="--", alpha=0.5, label="centreline")
 
         # ------------------------------------------------------------------
         # C+ (right-running) family — originate on the centreline,
         # slope = tan(θ_local + μ_local)  (wall angle + Mach angle).
         # ------------------------------------------------------------------
+        first_cplus = True
         for j in range(n_lines):
             x0 = j * x_end / max(n_lines - 1, 1)
             y0 = 0.0
@@ -197,13 +199,15 @@ class MOCSolver:
                 line_y.append(y)
 
             if len(line_x) > 1:
-                plt.plot(line_x, line_y,              color="tab:blue", alpha=line_alpha, linewidth=0.85)
-                plt.plot(line_x, [-y for y in line_y], color="tab:blue", alpha=line_alpha, linewidth=0.85)
+                lbl = "C+ (right-running)" if first_cplus else None
+                ax.plot(line_x, line_y, color="tab:blue", alpha=line_alpha, linewidth=0.85, label=lbl)
+                first_cplus = False
 
         # ------------------------------------------------------------------
         # C- (left-running) family — originate on the wall,
         # slope = tan(θ_local − μ_local)  (points downward to centreline).
         # ------------------------------------------------------------------
+        first_cminus = True
         for j in range(1, n_lines + 1):
             x0 = j * x_end / max(n_lines, 1)
             if x0 > x_end:
@@ -227,14 +231,17 @@ class MOCSolver:
             x_hit = max(0.0, min(x_end, x_hit))
             y_hit = max(0.0, y0 + tan_beta * (x_hit - x0))
 
-            plt.plot([x0, x_hit], [y0, y_hit],              color="tab:red", alpha=line_alpha, linewidth=0.85)
-            plt.plot([x0, x_hit], [-y0, -y_hit], color="tab:red", alpha=line_alpha, linewidth=0.85)
+            lbl = "C− (left-running)" if first_cminus else None
+            ax.plot([x0, x_hit], [y0, y_hit], color="tab:red", alpha=line_alpha, linewidth=0.85, label=lbl)
+            first_cminus = False
 
-        plt.xlabel("x [m]")
-        plt.ylabel("y [m]")
-        plt.title(f"MOC Characteristic Lines  (C+ blue, C− red)  |  Mₑ = {self.machExit:.2f}")
-        plt.grid(True, alpha=0.20)
-        plt.axis("equal")
-        plt.tight_layout()
-        plt.savefig(savepath, dpi=180)
-        plt.close()
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("r [m]")
+        ax.set_title(f"MOC Characteristic Lines  (C+ blue, C− red)  |  Mₑ = {self.machExit:.2f}")
+        ax.set_ylim(bottom=-0.002)
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.grid(True, alpha=0.20)
+        ax.legend(fontsize=7, loc="upper left")
+        fig.tight_layout()
+        fig.savefig(savepath, dpi=180)
+        plt.close(fig)
