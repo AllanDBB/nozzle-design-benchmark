@@ -1,3 +1,18 @@
+"""Swarm Intelligence Pipeline for Nozzle Design Optimisation.
+
+Replaces the evolutionary/genetic approach with Particle Swarm Optimisation
+(PSO) using adaptive inertia.  The MOC, RANS, and benchmarking infrastructure
+is reused; only the optimisation phase changes.
+
+Pipeline phases
+---------------
+Phase 1 — MOC Baseline      (2-D planar Prandtl-Meyer isentropic)
+Phase 2 — PSO Optimisation   (Quasi-1D surrogate, swarm intelligence)
+Phase 3 — RANS Validation    (OpenFOAM shockFluid, if Docker available)
+Phase 4 — Multi-fidelity Comparison Table
+Phase 5 — SI Diagnostic Plots + MLN nozzle with 50 characteristic lines
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -9,13 +24,15 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from analysis import AnalysisNote, generate_comparison_plots, generate_optimization_plots
+from analysis import AnalysisNote, generate_comparison_plots
+from analysis.SwarmPlots import generate_swarm_plots, plot_mln_with_characteristics
 from benchmarks import BenchmarkSuite
 from evaluators import CFDSimulation, OpenFOAMRANSEvaluator, EvaluationResult
 from geometry import MOCSolver, NozzleGeometry, MinimumLengthNozzle
-from optimization import Optimizer, OptimizationRunner
+from optimization import OptimizationRunner
+from optimization.SwarmOptimizer import SwarmOptimizer
 
 
 # ---------------------------------------------------------------------------
@@ -26,23 +43,23 @@ def _import_multiobjective():
         "multiobjective_rank",
         Path(__file__).parent / "scripts" / "multiobjective_rank.py",
     )
-    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
     return mod.run_multiobjective
 
 
 try:
     _run_multiobjective = _import_multiobjective()
 except Exception:
-    _run_multiobjective = None  # type: ignore[assignment]
+    _run_multiobjective = None
 
 
 # ---------------------------------------------------------------------------
-# Default configuration -- production-sized GA, real RANS integration
+# Default configuration — PSO-centred
 # ---------------------------------------------------------------------------
 def default_config() -> Dict[str, Any]:
     return {
-        "out_dir": "out/pipeline",
+        "out_dir": "out/swarm_pipeline",
         # ---- MOC baseline ----
         "moc": {
             "mach_exit": 2.3,
@@ -65,7 +82,6 @@ def default_config() -> Dict[str, Any]:
             "stagnation_pressure": 3.0e5,
             "ambient_pressure": 2.4e4,
             "n_samples": 90,
-            # Quasi-1D loss model
             "friction_scale": 0.2,
             "cf_multiplier": 1.0,
             "curvature_scale": 0.05,
@@ -112,27 +128,31 @@ def default_config() -> Dict[str, Any]:
                 "ux_out_rel_std_max": 1.20,
             },
         },
-        # ---- Optimization ----
+        # ---- PSO Optimisation ----
         "optimization": {
-            "algorithm": "evolutionary",
+            "algorithm": "pso",
             "seed": 42,
             "bounds": {
                 "exit_radius": [0.050, 0.070],
                 "length": [0.18, 0.28],
                 "straighten_frac": [0.30, 0.70],
             },
-            # -- GA hyper-parameters (production) --
-            "population": 20,
-            "generations": 8,
-            "sigma": 0.10,
+            # -- PSO hyper-parameters --
+            "swarm_size": 30,
+            "iterations": 15,
+            "w_max": 0.9,
+            "w_min": 0.4,
+            "c1": 2.0,
+            "c2": 2.0,
+            "v_max_frac": 0.25,
             "n_points": 180,
             "profile": "mln",
             # Multi-objective weights
             "w_thrust": 0.7,
             "w_pressure_loss": 0.3,
-            # Parallel workers for batch evaluation
+            # Parallel workers
             "n_workers": 1,
-            # RANS validation: top Pareto candidates to validate
+            # RANS validation top-K
             "rans_top_k": 5,
             # Penalty terms
             "objective_terms": {
@@ -141,13 +161,16 @@ def default_config() -> Dict[str, Any]:
                 "overexpanded_outlet_osc_penalty": 0.05,
                 "overexpanded_wall_rms_penalty": 0.03,
             },
+            # MOC characteristic lines on nozzle plots
+            "n_char_lines": 50,
         },
     }
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (shared with main_pipeline)
 # ---------------------------------------------------------------------------
+
 def build_geometry_from_params(
     params: Dict[str, float],
     throat_radius: float,
@@ -156,7 +179,6 @@ def build_geometry_from_params(
     gamma: float,
     gid: str,
 ) -> NozzleGeometry:
-    """Build an MLN-shaped nozzle geometry for optimisation candidates."""
     mln = MinimumLengthNozzle(
         mach_exit=mach_exit,
         throat_radius=throat_radius,
@@ -168,7 +190,7 @@ def build_geometry_from_params(
     )
     geom = mln.build()
     geom.metadata["id"] = gid
-    geom.metadata["source"] = "OPT"
+    geom.metadata["source"] = "PSO"
     return geom
 
 
@@ -192,6 +214,7 @@ def _write_run_meta(out_dir: Path, config: Dict[str, Any], backend: str) -> None
         "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "git_sha": _git_sha(),
         "backend": backend,
+        "optimizer": "PSO (Swarm Intelligence)",
         "config_effective": config,
     }
     (out_dir / "run_meta.json").write_text(
@@ -200,44 +223,26 @@ def _write_run_meta(out_dir: Path, config: Dict[str, Any], backend: str) -> None
 
 
 def _docker_available() -> bool:
-    """Check if Docker daemon is reachable (needed for OpenFOAM RANS)."""
     try:
-        r = subprocess.run(
-            ["docker", "info"],
-            capture_output=True, timeout=10,
-        )
+        r = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
         return r.returncode == 0
     except Exception:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Performance metric helpers (paper-quality derived quantities)
-# ---------------------------------------------------------------------------
 def _compute_performance_metrics(
     result: EvaluationResult,
     geometry: NozzleGeometry,
     cfg: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Derive paper-grade metrics from an EvaluationResult.
-
-    Returns dict with:
-      - C_F          : thrust coefficient  F / (p0 * A_throat)
-      - Isp          : specific impulse  F / (mdot * g0)   [s]
-      - eta_div      : divergence efficiency
-      - exit_mach    : Mach at last profile station
-      - exit_angle_deg : wall half-angle at exit [deg]
-      - pressure_recovery : p_t_exit / p0
-    """
     gamma = float(cfg.get("gamma", 1.4))
     gas_r = float(cfg.get("gas_constant", 287.0))
-    p0    = float(cfg.get("stagnation_pressure", 3.0e5))
-    t0    = float(cfg.get("stagnation_temperature", 900.0))
-    pa    = float(cfg.get("ambient_pressure", 2.4e4))
+    p0 = float(cfg.get("stagnation_pressure", 3.0e5))
+    t0 = float(cfg.get("stagnation_temperature", 900.0))
     depth = float(cfg.get("depth", 0.02))
-    dim   = str(cfg.get("dimension", "2d_planar"))
-    cd    = float(cfg.get("discharge_coefficient", 0.985))
-    g0    = 9.80665
+    dim = str(cfg.get("dimension", "2d_planar"))
+    cd = float(cfg.get("discharge_coefficient", 0.985))
+    g0 = 9.80665
 
     throat_y = geometry.throat_radius
     if dim in ("2d_planar", "3d_channel"):
@@ -245,7 +250,6 @@ def _compute_performance_metrics(
     else:
         a_throat = math.pi * throat_y ** 2
 
-    # Choked mass flow
     mdot = (
         cd * a_throat * p0
         / math.sqrt(max(t0, 1e-6))
@@ -254,13 +258,11 @@ def _compute_performance_metrics(
     )
 
     thrust = float(result.thrust)
-    c_f  = thrust / max(p0 * a_throat, 1e-12)
-    isp  = thrust / max(mdot * g0, 1e-12)
-
+    c_f = thrust / max(p0 * a_throat, 1e-12)
+    isp = thrust / max(mdot * g0, 1e-12)
     exit_mach = result.machProfile[-1] if result.machProfile else 0.0
     wall_angles = geometry.wall_angles()
     exit_angle_deg = math.degrees(abs(wall_angles[-1])) if wall_angles else 0.0
-
     eta_div = float(result.metadata.get("eta_div", 1.0))
     pressure_recovery = 1.0 - float(result.pressureLoss)
 
@@ -277,117 +279,114 @@ def _compute_performance_metrics(
     }
 
 
-def _fidelity_gap(q1d_metrics: Dict[str, Any], rans_metrics: Dict[str, Any]) -> Dict[str, Any]:
-    """Compute relative differences between Q1D and RANS metrics (for paper Table)."""
+def _fidelity_gap(q1d: Dict[str, Any], rans: Dict[str, Any]) -> Dict[str, Any]:
     gap: Dict[str, Any] = {}
     for key in ("thrust_N", "C_F", "Isp_s", "exit_mach", "pressure_loss"):
-        v_q = float(q1d_metrics.get(key, 0))
-        v_r = float(rans_metrics.get(key, 0))
-        ref = max(abs(v_r), abs(v_q), 1e-12)
-        gap[f"delta_{key}"] = round(v_r - v_q, 6)
-        gap[f"delta_{key}_pct"] = round(100.0 * (v_r - v_q) / ref, 3)
+        vq = float(q1d.get(key, 0))
+        vr = float(rans.get(key, 0))
+        ref = max(abs(vr), abs(vq), 1e-12)
+        gap[f"delta_{key}"] = round(vr - vq, 6)
+        gap[f"delta_{key}_pct"] = round(100.0 * (vr - vq) / ref, 3)
     return gap
 
 
 # ---------------------------------------------------------------------------
-# 5-Phase Pipeline
-#   Phase 1 -- MOC Baseline (Prandtl-Meyer isentropic)
-#   Phase 2 -- GA Optimisation (Quasi-1D surrogate)
-#   Phase 3 -- RANS Validation (MOC + top-K GA candidates)
-#   Phase 4 -- Multi-fidelity Comparison (Q1D vs RANS table)
-#   Phase 5 -- Report & Plots
+# 5-Phase Swarm Intelligence Pipeline
 # ---------------------------------------------------------------------------
+
 def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.time()
-    out_dir  = Path(config["out_dir"])
-    moc_dir  = out_dir / "moc"
-    opt_dir  = out_dir / "opt"
+    out_dir = Path(config["out_dir"])
+    moc_dir = out_dir / "moc"
+    opt_dir = out_dir / "pso"
     rans_dir = out_dir / "rans"
     comp_dir = out_dir / "comp"
     for d in [out_dir, moc_dir, opt_dir, rans_dir, comp_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    moc_cfg  = config["moc"]
+    moc_cfg = config["moc"]
     eval_cfg = dict(config["evaluator"])
-    opt_cfg  = config["optimization"]
-    backend  = str(eval_cfg.get("backend", "quasi1d")).lower()
+    opt_cfg = config["optimization"]
+    backend = str(eval_cfg.get("backend", "quasi1d")).lower()
+
+    swarm_size = int(opt_cfg.get("swarm_size", 30))
+    iterations = int(opt_cfg.get("iterations", 15))
+    n_char = int(opt_cfg.get("n_char_lines", 50))
+    total_evals = swarm_size * (iterations + 1)
 
     _log(
-        f"Pipeline START  |  backend={backend}  "
-        f"algorithm={opt_cfg.get('algorithm', '?')}  "
-        f"pop={opt_cfg.get('population','?')}  gen={opt_cfg.get('generations','?')}",
+        f"SI Pipeline START  |  backend={backend}  "
+        f"algorithm=PSO  swarm={swarm_size}  iter={iterations}  "
+        f"~{total_evals} evals  char_lines={n_char}",
         t0,
     )
     _log(f"Output -> {out_dir.resolve()}", t0)
     _write_run_meta(out_dir, config, backend=backend)
 
-    # Shared evaluator knobs
-    eval_cfg["design_pressure_ratio"] = float(
-        moc_cfg.get("pressure_ratio", 0.10)
-    )
-    throat  = float(moc_cfg["geometry"]["throat_y"])
-    n_pts   = int(opt_cfg.get("n_points", 180))
-    mach_e  = float(moc_cfg.get("mach_exit", 2.3))
-    gamma   = float(moc_cfg.get("gamma", 1.4))
+    eval_cfg["design_pressure_ratio"] = float(moc_cfg.get("pressure_ratio", 0.10))
+    throat = float(moc_cfg["geometry"]["throat_y"])
+    n_pts = int(opt_cfg.get("n_points", 180))
+    mach_e = float(moc_cfg.get("mach_exit", 2.3))
+    gamma = float(moc_cfg.get("gamma", 1.4))
+    p_ratio = float(moc_cfg.get("pressure_ratio", 0.08))
 
-    # Quasi-1D config (always available as the cheap surrogate)
     q1d_cfg = dict(eval_cfg)
     q1d_cfg["backend"] = "quasi1d"
 
-    # RANS config (only used when RANS is enabled)
     rans_cfg = {
         **eval_cfg,
         "backend": "openfoam",
-        "mach_exit": float(moc_cfg.get("mach_exit", 2.3)),
-        "pressure_ratio": float(moc_cfg.get("pressure_ratio", 0.10)),
+        "mach_exit": mach_e,
+        "pressure_ratio": p_ratio,
     }
 
-    # Determine if RANS is actually available
     run_rans = backend == "openfoam"
     if run_rans and not _docker_available():
-        _log("WARNING: backend=openfoam but Docker not available -- RANS disabled", t0)
+        _log("WARNING: backend=openfoam but Docker not available — RANS disabled", t0)
         run_rans = False
 
     # ==================================================================
-    # PHASE 1 -- MOC Baseline
+    # PHASE 1 — MOC Baseline
     # ==================================================================
     _log("=" * 60, t0)
     _log("PHASE 1  |  MOC Baseline (2-D planar Prandtl-Meyer)", t0)
     _log("=" * 60, t0)
 
     moc_solver = MOCSolver(
-        machExit=float(moc_cfg["mach_exit"]),
-        pressureRatio=float(moc_cfg["pressure_ratio"]),
-        gamma=float(moc_cfg.get("gamma", 1.4)),
+        machExit=mach_e,
+        pressureRatio=p_ratio,
+        gamma=gamma,
     )
     moc_geometry = moc_solver.generateGeometry({**moc_cfg["geometry"]})
     moc_geometry.metadata["id"] = "moc_baseline"
     _log(
-        f"  MOC geometry  |  Me={moc_cfg['mach_exit']}  "
+        f"  MOC geometry  |  Me={mach_e}  "
         f"throat={throat*1000:.1f} mm  "
         f"exit={float(moc_cfg['geometry']['exit_y'])*1000:.1f} mm  "
         f"L={float(moc_cfg['geometry']['length'])*1000:.1f} mm",
         t0,
     )
 
-    # Export artefacts
     moc_geometry.exportGeo(str(moc_dir / "moc_geometry.csv"))
     moc_geometry.plotProfile(str(moc_dir / "moc_geometry.png"))
 
     # MLN auxiliary plot
     _mln = MinimumLengthNozzle.from_params(
-        moc_cfg["geometry"],
-        mach_exit=float(moc_cfg["mach_exit"]),
-        gamma=float(moc_cfg.get("gamma", 1.4)),
+        moc_cfg["geometry"], mach_exit=mach_e, gamma=gamma
     )
     _mln.plot(str(moc_dir / "mln_geometry.png"))
 
-    # Characteristic network plot (textbook style)
-    moc_solver.plotCharacteristics(
-        moc_geometry, str(moc_dir / "moc_characteristics.png")
+    # Characteristic network — 50 lines (textbook style)
+    plot_mln_with_characteristics(
+        moc_geometry,
+        mach_exit=mach_e,
+        pressure_ratio=p_ratio,
+        gamma=gamma,
+        savepath=str(moc_dir / "moc_characteristics_50.png"),
+        n_char_lines=n_char,
     )
 
-    # Evaluate MOC baseline with Quasi-1D
+    # Q1D evaluation of baseline
     moc_q1d_eval = CFDSimulation(
         geometry=moc_geometry, solverConfig=q1d_cfg, resultPath=str(out_dir)
     )
@@ -406,16 +405,18 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # ==================================================================
-    # PHASE 2 -- GA Optimisation (Quasi-1D surrogate)
+    # PHASE 2 — PSO Optimisation
     # ==================================================================
     _log("=" * 60, t0)
-    _log("PHASE 2  |  GA Optimisation (Quasi-1D surrogate)", t0)
+    _log("PHASE 2  |  PSO Optimisation (Swarm Intelligence + Q1D)", t0)
     _log("=" * 60, t0)
-
-    pop  = int(opt_cfg.get("population", 20))
-    gens = int(opt_cfg.get("generations", 8))
-    total_evals = pop * gens
-    _log(f"  population={pop}  generations={gens}  ~{total_evals} evals", t0)
+    _log(
+        f"  swarm_size={swarm_size}  iterations={iterations}  "
+        f"w=[{opt_cfg.get('w_max', 0.9):.2f}→{opt_cfg.get('w_min', 0.4):.2f}]  "
+        f"c1={opt_cfg.get('c1', 2.0)}  c2={opt_cfg.get('c2', 2.0)}  "
+        f"~{total_evals} evals",
+        t0,
+    )
 
     _gid_counter = 0
     _gid_lock = threading.Lock()
@@ -425,7 +426,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         with _gid_lock:
             idx = _gid_counter
             _gid_counter += 1
-        return f"opt_{idx:04d}"
+        return f"pso_{idx:04d}"
 
     def objective(param_dict: Dict[str, float]) -> EvaluationResult:
         gid = _next_gid()
@@ -437,6 +438,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         try:
             result = local_eval.extractResults()
             result.geometryId = gid
+            result.metadata["params"] = dict(param_dict)
             dt_s = time.time() - t_start
             _log(
                 f"  {gid}  F={result.thrust:8.2f} N  "
@@ -464,21 +466,21 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     }
     search_space["campaign"] = str(eval_cfg.get("campaign", "")).lower()
 
-    optimizer = Optimizer(
+    optimizer = SwarmOptimizer(
         searchSpace=search_space,
         objectiveFunc=objective,
-        algorithm=str(opt_cfg.get("algorithm", "evolutionary")),
+        algorithm="pso",
         seed=int(opt_cfg.get("seed", 42)),
     )
     runner = OptimizationRunner(
         optimizer=optimizer,
         evaluator=moc_q1d_eval,
-        historyPath=str(opt_dir / "optimization_history.json"),
+        historyPath=str(opt_dir / "pso_history.json"),
     )
 
     runner.start()
     runner.saveHistory()
-    _log(f"  GA DONE  |  {len(optimizer._history)} evaluations", t0)
+    _log(f"  PSO DONE  |  {len(optimizer._history)} evaluations", t0)
 
     # ---- Pareto analysis ----
     _log("  Running Pareto / multi-objective ranking ...", t0)
@@ -501,11 +503,9 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as exc:
             mo_summary = {"error": str(exc)}
 
-    # ---- Select best candidate (Pareto knee-point preferred) ----
+    # ---- Select best candidate ----
     if mo_summary and "best_pareto_knee" in mo_summary:
-        knee_idx = int(
-            mo_summary["best_pareto_knee"].get("candidate_index", -1)
-        )
+        knee_idx = int(mo_summary["best_pareto_knee"].get("candidate_index", -1))
         if 0 <= knee_idx < len(optimizer._history):
             selected_idx = knee_idx
             _log(f"  Selected Pareto knee-point candidate #{knee_idx}", t0)
@@ -517,7 +517,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         _log(f"  Best-score candidate #{selected_idx}", t0)
 
     best_params = optimizer._history_params[selected_idx]
-    best_q1d    = optimizer._history[selected_idx]
+    best_q1d = optimizer._history[selected_idx]
     _log(
         f"  Best Q1D  |  F={best_q1d.thrust:.3f} N  "
         f"loss={best_q1d.pressureLoss:.5f}  params={best_params}",
@@ -525,12 +525,12 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     optimized_geometry = build_geometry_from_params(
-        best_params, throat, n_pts, mach_e, gamma, "optimized_best"
+        best_params, throat, n_pts, mach_e, gamma, "pso_best"
     )
-    optimized_geometry.exportGeo(str(opt_dir / "optimized_geometry.csv"))
-    optimized_geometry.plotProfile(str(opt_dir / "optimized_geometry.png"))
+    optimized_geometry.exportGeo(str(opt_dir / "pso_geometry.csv"))
+    optimized_geometry.plotProfile(str(opt_dir / "pso_geometry.png"))
 
-    # MLN auxiliary plot for the optimized geometry
+    # MLN plot for the PSO-optimised geometry
     _opt_mln = MinimumLengthNozzle(
         mach_exit=mach_e,
         throat_radius=throat,
@@ -540,14 +540,11 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         n_points=n_pts,
         straighten_frac=float(best_params.get("straighten_frac", 0.45)),
     )
-    _opt_mln.plot(str(opt_dir / "optimized_mln_geometry.png"))
+    _opt_mln.plot(str(opt_dir / "pso_mln_geometry.png"))
 
-    # Characteristic network plot for the optimized geometry
-    # Build a MOC-consistent geometry so wall + characteristics are aligned
+    # MOC-consistent geometry for the char network plot
     opt_moc_solver = MOCSolver(
-        machExit=mach_e,
-        pressureRatio=float(moc_cfg["pressure_ratio"]),
-        gamma=gamma,
+        machExit=mach_e, pressureRatio=p_ratio, gamma=gamma,
     )
     opt_moc_geom = opt_moc_solver.generateGeometry({
         "throat_y": throat,
@@ -555,8 +552,14 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         "length": float(best_params["length"]),
         "n_points": n_pts,
     })
-    opt_moc_solver.plotCharacteristics(
-        opt_moc_geom, str(opt_dir / "optimized_characteristics.png")
+    # 50-line characteristic plot for the PSO-best nozzle
+    plot_mln_with_characteristics(
+        opt_moc_geom,
+        mach_exit=mach_e,
+        pressure_ratio=p_ratio,
+        gamma=gamma,
+        savepath=str(opt_dir / "pso_best_characteristics_50.png"),
+        n_char_lines=n_char,
     )
 
     opt_q1d_metrics = _compute_performance_metrics(
@@ -564,7 +567,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # ==================================================================
-    # PHASE 3 -- RANS Validation
+    # PHASE 3 — RANS Validation
     # ==================================================================
     _log("=" * 60, t0)
     moc_rans_result: Optional[EvaluationResult] = None
@@ -577,13 +580,11 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         _log("PHASE 3  |  RANS Validation (OpenFOAM shockFluid)", t0)
         _log("=" * 60, t0)
 
-        # 3a) RANS on MOC baseline (critical for paper: Q1D vs RANS on same geometry)
+        # 3a) MOC baseline RANS
         _log("  3a) RANS on MOC baseline geometry ...", t0)
         try:
             moc_rans_eval = OpenFOAMRANSEvaluator(
-                geometry=moc_geometry,
-                solverConfig=rans_cfg,
-                resultPath=str(rans_dir),
+                geometry=moc_geometry, solverConfig=rans_cfg, resultPath=str(rans_dir),
             )
             moc_rans_result = moc_rans_eval.extractResults()
             moc_rans_result.geometryId = "moc_baseline_rans"
@@ -594,46 +595,44 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
             _log(
                 f"  MOC RANS  |  F={moc_rans_metrics['thrust_N']:.3f} N  "
                 f"C_F={moc_rans_metrics['C_F']:.4f}  "
-                f"Isp={moc_rans_metrics['Isp_s']:.1f} s  "
                 f"Me={moc_rans_metrics['exit_mach']:.3f}",
                 t0,
             )
         except Exception as exc:
             _log(f"  MOC RANS FAILED: {exc}", t0)
 
-        # 3b) RANS on the GA-selected best candidate
-        _log("  3b) RANS on GA-optimised best candidate ...", t0)
+        # 3b) PSO-best RANS
+        _log("  3b) RANS on PSO-best candidate ...", t0)
         try:
             opt_rans_eval = OpenFOAMRANSEvaluator(
-                geometry=optimized_geometry,
-                solverConfig=rans_cfg,
+                geometry=optimized_geometry, solverConfig=rans_cfg,
                 resultPath=str(rans_dir),
             )
             opt_rans_result = opt_rans_eval.extractResults()
-            opt_rans_result.geometryId = "optimized_best_rans"
+            opt_rans_result.geometryId = "pso_best_rans"
             opt_rans_result.saveToJSON(str(rans_dir / "opt_rans_result.json"))
             opt_rans_metrics = _compute_performance_metrics(
                 opt_rans_result, optimized_geometry, eval_cfg
             )
             _log(
-                f"  OPT RANS  |  F={opt_rans_metrics['thrust_N']:.3f} N  "
+                f"  PSO RANS  |  F={opt_rans_metrics['thrust_N']:.3f} N  "
                 f"C_F={opt_rans_metrics['C_F']:.4f}  "
-                f"Isp={opt_rans_metrics['Isp_s']:.1f} s  "
                 f"Me={opt_rans_metrics['exit_mach']:.3f}",
                 t0,
             )
         except Exception as exc:
-            _log(f"  OPT RANS FAILED: {exc}", t0)
+            _log(f"  PSO RANS FAILED: {exc}", t0)
 
-        # 3c) RANS on additional top Pareto candidates
+        # 3c) Additional top candidates
         rans_top_k = int(opt_cfg.get("rans_top_k", 5))
         scored_idxs = sorted(
             range(len(optimizer._history)),
             key=lambda i: optimizer._objective_score(optimizer._history[i]),
             reverse=True,
         )
-        # Exclude the already-evaluated selected_idx
-        extra_idxs = [i for i in scored_idxs if i != selected_idx][:max(0, rans_top_k - 1)]
+        extra_idxs = [i for i in scored_idxs if i != selected_idx][
+            : max(0, rans_top_k - 1)
+        ]
 
         if extra_idxs:
             _log(f"  3c) RANS on {len(extra_idxs)} additional top candidates ...", t0)
@@ -644,9 +643,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
                 _log(f"    RANS #{idx} ({gid}) ...", t0)
                 try:
                     e = OpenFOAMRANSEvaluator(
-                        geometry=geom,
-                        solverConfig=rans_cfg,
-                        resultPath=str(rans_dir),
+                        geometry=geom, solverConfig=rans_cfg, resultPath=str(rans_dir),
                     )
                     r = e.extractResults()
                     r.geometryId = gid
@@ -658,11 +655,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
                         "params": dict(p),
                         **rm,
                     }
-                    _log(
-                        f"    {gid}  F={rm['thrust_N']:.3f} N  "
-                        f"loss={rm['pressure_loss']:.5f}  [OK]",
-                        t0,
-                    )
+                    _log(f"    {gid}  F={rm['thrust_N']:.3f} N  [OK]", t0)
                 except Exception as exc:
                     rans_candidates[gid] = {
                         "candidate_index": idx,
@@ -676,11 +669,14 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
             json.dumps(rans_candidates, indent=2), encoding="utf-8"
         )
     else:
-        _log("PHASE 3  |  RANS Validation  [skipped: no Docker / backend=quasi1d]", t0)
+        _log(
+            "PHASE 3  |  RANS Validation  [skipped: no Docker / backend=quasi1d]",
+            t0,
+        )
         _log("=" * 60, t0)
 
     # ==================================================================
-    # PHASE 4 -- Multi-fidelity Comparison Table
+    # PHASE 4 — Multi-fidelity Comparison Table
     # ==================================================================
     _log("=" * 60, t0)
     _log("PHASE 4  |  Multi-fidelity Comparison", t0)
@@ -688,32 +684,28 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
 
     fidelity_table: Dict[str, Any] = {
         "moc_q1d": moc_q1d_metrics,
-        "opt_q1d": opt_q1d_metrics,
+        "pso_q1d": opt_q1d_metrics,
     }
     if moc_rans_metrics:
         fidelity_table["moc_rans"] = moc_rans_metrics
-        fidelity_table["moc_fidelity_gap"] = _fidelity_gap(
-            moc_q1d_metrics, moc_rans_metrics
-        )
+        fidelity_table["moc_fidelity_gap"] = _fidelity_gap(moc_q1d_metrics, moc_rans_metrics)
     if opt_rans_metrics:
-        fidelity_table["opt_rans"] = opt_rans_metrics
-        fidelity_table["opt_fidelity_gap"] = _fidelity_gap(
-            opt_q1d_metrics, opt_rans_metrics
-        )
+        fidelity_table["pso_rans"] = opt_rans_metrics
+        fidelity_table["pso_fidelity_gap"] = _fidelity_gap(opt_q1d_metrics, opt_rans_metrics)
 
     (comp_dir / "fidelity_table.json").write_text(
         json.dumps(fidelity_table, indent=2), encoding="utf-8"
     )
 
-    # Print paper-ready comparison table
+    # Print table
     _log("", t0)
-    hdr = f"  {'Metric':<22s}  {'MOC-Q1D':>10s}  {'OPT-Q1D':>10s}"
+    hdr = f"  {'Metric':<22s}  {'MOC-Q1D':>10s}  {'PSO-Q1D':>10s}"
     sep_cols = 4
     if moc_rans_metrics:
         hdr += f"  {'MOC-RANS':>10s}"
         sep_cols += 1
     if opt_rans_metrics:
-        hdr += f"  {'OPT-RANS':>10s}"
+        hdr += f"  {'PSO-RANS':>10s}"
         sep_cols += 1
     table_sep = "  " + "-" * (sep_cols * 12 + 22)
     _log(table_sep, t0)
@@ -724,14 +716,14 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         return format(val, fmt).rjust(10)
 
     for key, label, fmt in [
-        ("thrust_N",          "Thrust [N]",        ".3f"),
-        ("C_F",               "C_F [-]",           ".4f"),
-        ("Isp_s",             "Isp [s]",           ".1f"),
-        ("exit_mach",         "Mach exit [-]",     ".4f"),
-        ("pressure_loss",     "Pressure loss [-]", ".5f"),
-        ("pressure_recovery", "p_t/p_0 [-]",       ".5f"),
-        ("eta_div",           "eta_div [-]",       ".4f"),
-        ("exit_angle_deg",    "Exit angle [deg]",  ".2f"),
+        ("thrust_N", "Thrust [N]", ".3f"),
+        ("C_F", "C_F [-]", ".4f"),
+        ("Isp_s", "Isp [s]", ".1f"),
+        ("exit_mach", "Mach exit [-]", ".4f"),
+        ("pressure_loss", "Pressure loss [-]", ".5f"),
+        ("pressure_recovery", "p_t/p_0 [-]", ".5f"),
+        ("eta_div", "eta_div [-]", ".4f"),
+        ("exit_angle_deg", "Exit angle [deg]", ".2f"),
     ]:
         row = f"  {label:<22s}"
         row += f"  {_fc(moc_q1d_metrics.get(key, 0), fmt)}"
@@ -747,28 +739,25 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         fg = fidelity_table["moc_fidelity_gap"]
         _log(
             f"  MOC fidelity gap:  dF={fg['delta_thrust_N_pct']:+.2f}%  "
-            f"dMe={fg['delta_exit_mach_pct']:+.2f}%  "
-            f"dLoss={fg['delta_pressure_loss_pct']:+.2f}%",
+            f"dMe={fg['delta_exit_mach_pct']:+.2f}%",
             t0,
         )
-    if fidelity_table.get("opt_fidelity_gap"):
-        fg = fidelity_table["opt_fidelity_gap"]
+    if fidelity_table.get("pso_fidelity_gap"):
+        fg = fidelity_table["pso_fidelity_gap"]
         _log(
-            f"  OPT fidelity gap:  dF={fg['delta_thrust_N_pct']:+.2f}%  "
-            f"dMe={fg['delta_exit_mach_pct']:+.2f}%  "
-            f"dLoss={fg['delta_pressure_loss_pct']:+.2f}%",
+            f"  PSO fidelity gap:  dF={fg['delta_thrust_N_pct']:+.2f}%  "
+            f"dMe={fg['delta_exit_mach_pct']:+.2f}%",
             t0,
         )
     _log("", t0)
 
     # ==================================================================
-    # PHASE 5 -- Benchmark Plots & Report
+    # PHASE 5 — SI Diagnostic Plots + Benchmark
     # ==================================================================
     _log("=" * 60, t0)
-    _log("PHASE 5  |  Benchmark Plots & Report", t0)
+    _log("PHASE 5  |  SI Diagnostic Plots & Benchmark", t0)
     _log("=" * 60, t0)
 
-    # Use RANS results for comparison if available, otherwise Q1D
     final_moc_result = moc_rans_result if moc_rans_result else moc_q1d_result
     final_opt_result = opt_rans_result if opt_rans_result else best_q1d
 
@@ -787,27 +776,24 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         suite.runAll()
         comparison = suite.save(str(comp_dir))
 
-        # Optimisation convergence plots
-        generate_optimization_plots(
+        # SI-specific plots
+        generate_swarm_plots(
+            optimizer=optimizer,
             history=optimizer._history,
             out_dir=str(opt_dir),
+            swarm_size=swarm_size,
             moc_thrust=float(moc_q1d_result.thrust),
             moc_pressure_loss=float(moc_q1d_result.pressureLoss),
-            population=(
-                pop
-                if str(opt_cfg.get("algorithm", "")).lower()
-                in {"ga", "cma-es", "evolutionary"}
-                else None
-            ),
             moc_geometry=moc_geometry,
             throat_radius=throat,
-            n_points=n_pts,
-            gamma=gamma,
-            gas_constant=float(eval_cfg.get("gas_constant", 287.0)),
             mach_exit=mach_e,
+            gamma=gamma,
+            pressure_ratio=p_ratio,
+            n_points=n_pts,
+            n_char_lines=n_char,
         )
 
-        # Side-by-side comparison plots
+        # Comparison plots (MOC vs PSO-best)
         if suite.mocResult is not None and suite.optResult is not None:
             generate_comparison_plots(
                 moc_geometry=moc_geometry,
@@ -816,7 +802,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
                 optimized_result=suite.optResult,
                 out_dir=str(comp_dir),
                 solver_config=eval_cfg,
-                mach_exit=float(moc_cfg.get("mach_exit", 2.0)),
+                mach_exit=mach_e,
             )
 
         # Field plots
@@ -826,7 +812,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
 
         bench_eval.geometry = optimized_geometry
         bench_eval.extractResults()
-        bench_eval.plotFields(str(opt_dir / "optimized_fields.png"))
+        bench_eval.plotFields(str(opt_dir / "pso_fields.png"))
 
     except Exception as exc:
         benchmark_error = str(exc)
@@ -837,43 +823,48 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
 
     # ---- Analysis report ----
     note = AnalysisNote(
-        title="Nozzle Design Benchmark Report",
+        title="Nozzle Design Benchmark — Swarm Intelligence (PSO)",
         notes=(
             "5-phase pipeline: (1) MOC baseline via Prandtl-Meyer isentropic "
-            "characteristic mesh, (2) evolutionary/GA optimisation with a "
-            "Quasi-1D surrogate evaluator, (3) RANS validation using OpenFOAM "
-            "shockFluid (density-based Kurganov), (4) multi-fidelity Q1D-vs-RANS "
-            "comparison table, (5) benchmark plots and report.  "
-            "Pareto knee-point selection for multi-objective trade-off."
+            "characteristic mesh, (2) Particle Swarm Optimisation with adaptive "
+            "inertia and Quasi-1D surrogate evaluator, (3) RANS validation "
+            "using OpenFOAM shockFluid, (4) multi-fidelity comparison table, "
+            "(5) SI diagnostic plots and MLN nozzle with 50 characteristic lines.  "
+            "PSO replaces the evolutionary/GA search with swarm intelligence."
         ),
     )
-    # Comparison metrics
     for k, v in comparison.items():
         note.addMetric(k, v)
 
-    # GA summary
-    note.addMetric("optimizer_algorithm", optimizer.algorithm)
+    note.addMetric("optimizer_algorithm", "PSO (Particle Swarm Optimisation)")
     note.addMetric("optimizer_evaluations", len(optimizer._history))
-    note.addMetric("ga_population", pop)
-    note.addMetric("ga_generations", gens)
+    note.addMetric("pso_swarm_size", swarm_size)
+    note.addMetric("pso_iterations", iterations)
+    note.addMetric("pso_w_max", float(opt_cfg.get("w_max", 0.9)))
+    note.addMetric("pso_w_min", float(opt_cfg.get("w_min", 0.4)))
+    note.addMetric("pso_c1", float(opt_cfg.get("c1", 2.0)))
+    note.addMetric("pso_c2", float(opt_cfg.get("c2", 2.0)))
     note.addMetric("best_parameters", best_params)
     note.addMetric("selected_candidate_index", selected_idx)
+    note.addMetric("n_characteristic_lines", n_char)
 
-    # Performance metrics
     note.addMetric("moc_q1d_performance", moc_q1d_metrics)
-    note.addMetric("opt_q1d_performance", opt_q1d_metrics)
+    note.addMetric("pso_q1d_performance", opt_q1d_metrics)
     if moc_rans_metrics:
         note.addMetric("moc_rans_performance", moc_rans_metrics)
     if opt_rans_metrics:
-        note.addMetric("opt_rans_performance", opt_rans_metrics)
+        note.addMetric("pso_rans_performance", opt_rans_metrics)
     note.addMetric("fidelity_table", fidelity_table)
 
-    # Population statistics
     if optimizer._history:
         thrust_vals = [float(r.thrust) for r in optimizer._history]
-        loss_vals   = [float(r.pressureLoss) for r in optimizer._history]
+        loss_vals = [float(r.pressureLoss) for r in optimizer._history]
         note.addMetric("thrust_mean", sum(thrust_vals) / len(thrust_vals))
-        note.addMetric("thrust_std", (sum((t - sum(thrust_vals)/len(thrust_vals))**2 for t in thrust_vals) / len(thrust_vals))**0.5)
+        note.addMetric(
+            "thrust_std",
+            (sum((t - sum(thrust_vals) / len(thrust_vals)) ** 2 for t in thrust_vals)
+             / len(thrust_vals)) ** 0.5,
+        )
         note.addMetric("pressure_loss_mean", sum(loss_vals) / len(loss_vals))
     if mo_summary:
         note.addMetric("multiobjective_summary", mo_summary)
@@ -888,7 +879,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         "status": "ok" if not benchmark_error else "failed",
         "out_dir": str(out_dir),
         "moc_geometry": str(moc_dir / "moc_geometry.csv"),
-        "optimized_geometry": str(opt_dir / "optimized_geometry.csv"),
+        "pso_geometry": str(opt_dir / "pso_geometry.csv"),
         "comparison": comparison,
         "multiobjective": mo_summary,
         "fidelity_table": fidelity_table,
@@ -900,7 +891,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         json.dumps(summary, indent=2), encoding="utf-8"
     )
     _log(
-        f"Pipeline DONE  |  status={summary['status']}  "
+        f"SI Pipeline DONE  |  status={summary['status']}  "
         f"elapsed={elapsed_total:.1f}s  rans={'yes' if run_rans else 'no'}",
         t0,
     )
@@ -910,17 +901,14 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Nozzle design benchmark: MOC -> GA/Q1D -> RANS -> Compare -> Report"
+        description="Nozzle design benchmark: MOC -> PSO/Q1D -> RANS -> Compare -> Report"
     )
     parser.add_argument(
         "--config", type=str, default="",
         help="JSON config file (overrides defaults)",
-    )
-    parser.add_argument(
-        "--algorithm", type=str, default="",
-        help="Override optimiser algorithm (evolutionary|random|grid|bayesian_proxy)",
     )
     parser.add_argument(
         "--out", type=str, default="",
@@ -931,8 +919,16 @@ def parse_args() -> argparse.Namespace:
         help="Override evaluator backend (quasi1d|openfoam)",
     )
     parser.add_argument(
+        "--swarm-size", type=int, default=0,
+        help="Override PSO swarm size",
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=0,
+        help="Override PSO iterations",
+    )
+    parser.add_argument(
         "--quick", action="store_true",
-        help="Quick mode: small GA (pop=6 gen=2) for fast smoke tests",
+        help="Quick mode: small swarm (size=8 iter=3) for fast smoke tests",
     )
     return parser.parse_args()
 
@@ -942,41 +938,37 @@ def main() -> None:
     cfg = default_config()
 
     if args.config:
-        user_cfg = json.loads(
-            Path(args.config).read_text(encoding="utf-8-sig")
-        )
+        user_cfg = json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
         for key, value in user_cfg.items():
-            if (
-                isinstance(value, dict)
-                and key in cfg
-                and isinstance(cfg[key], dict)
-            ):
+            if isinstance(value, dict) and key in cfg and isinstance(cfg[key], dict):
                 cfg[key].update(value)
             else:
                 cfg[key] = value
 
-    if args.algorithm:
-        cfg["optimization"]["algorithm"] = args.algorithm
     if args.out:
         cfg["out_dir"] = args.out
     if args.backend:
         cfg["evaluator"]["backend"] = args.backend
+    if args.swarm_size > 0:
+        cfg["optimization"]["swarm_size"] = args.swarm_size
+    if args.iterations > 0:
+        cfg["optimization"]["iterations"] = args.iterations
     if args.quick:
-        cfg["optimization"]["population"] = 6
-        cfg["optimization"]["generations"] = 2
+        cfg["optimization"]["swarm_size"] = 8
+        cfg["optimization"]["iterations"] = 3
         cfg["optimization"]["rans_top_k"] = 2
 
     summary = run_pipeline(cfg)
 
     # ---------- Formatted results ----------
-    cmp   = summary.get("comparison", {})
-    mo    = summary.get("multiobjective", {})
-    ftbl  = summary.get("fidelity_table", {})
-    sep   = "-" * 60
+    cmp = summary.get("comparison", {})
+    mo = summary.get("multiobjective", {})
+    ftbl = summary.get("fidelity_table", {})
+    sep = "-" * 60
 
     print()
     print(sep)
-    print("  NOZZLE DESIGN BENCHMARK - RESULTS")
+    print("  NOZZLE DESIGN BENCHMARK — SWARM INTELLIGENCE (PSO)")
     print(sep)
     print(f"  Status       : {summary.get('status', '?').upper()}")
     print(f"  Elapsed      : {summary.get('elapsed_seconds', 0):.1f} s")
@@ -984,18 +976,17 @@ def main() -> None:
     print(f"  Output dir   : {summary.get('out_dir', '')}")
     print(sep)
 
-    # Q1D comparison
     if cmp and cmp.get("status") != "failed":
-        print("  Q1D COMPARISON  (MOC baseline vs GA-optimised)")
+        print("  Q1D COMPARISON  (MOC baseline vs PSO-optimised)")
         fmt_h = "  {:<25s}  {:>10s}  {:>10s}  {:>12s}"
-        print(fmt_h.format("", "MOC", "OPT", "delta"))
-        moc_t  = cmp.get("moc_thrust", 0)
-        opt_t  = cmp.get("optimized_thrust", 0)
+        print(fmt_h.format("", "MOC", "PSO", "delta"))
+        moc_t = cmp.get("moc_thrust", 0)
+        opt_t = cmp.get("optimized_thrust", 0)
         moc_pl = cmp.get("moc_pressure_loss", 0)
         opt_pl = cmp.get("optimized_pressure_loss", 0)
-        d_t    = cmp.get("delta_thrust", 0)
-        d_t_p  = cmp.get("delta_thrust_percent", 0)
-        d_pl   = cmp.get("delta_pressure_loss", 0)
+        d_t = cmp.get("delta_thrust", 0)
+        d_t_p = cmp.get("delta_thrust_percent", 0)
+        d_pl = cmp.get("delta_pressure_loss", 0)
         print(
             f"  {'Thrust [N]':<25s}  {moc_t:>10.3f}  {opt_t:>10.3f}"
             f"  {d_t:>+10.3f} ({d_t_p:+.2f}%)"
@@ -1006,26 +997,22 @@ def main() -> None:
         )
         print(sep)
 
-    # Fidelity gap (paper's key result)
-    if ftbl.get("moc_fidelity_gap") or ftbl.get("opt_fidelity_gap"):
+    if ftbl.get("moc_fidelity_gap") or ftbl.get("pso_fidelity_gap"):
         print("  MULTI-FIDELITY GAP  (Q1D vs RANS)")
         if ftbl.get("moc_fidelity_gap"):
             fg = ftbl["moc_fidelity_gap"]
             print(
                 f"  MOC:  dThrust={fg.get('delta_thrust_N_pct', 0):+.2f}%  "
-                f"dMach={fg.get('delta_exit_mach_pct', 0):+.2f}%  "
-                f"dLoss={fg.get('delta_pressure_loss_pct', 0):+.2f}%"
+                f"dMach={fg.get('delta_exit_mach_pct', 0):+.2f}%"
             )
-        if ftbl.get("opt_fidelity_gap"):
-            fg = ftbl["opt_fidelity_gap"]
+        if ftbl.get("pso_fidelity_gap"):
+            fg = ftbl["pso_fidelity_gap"]
             print(
-                f"  OPT:  dThrust={fg.get('delta_thrust_N_pct', 0):+.2f}%  "
-                f"dMach={fg.get('delta_exit_mach_pct', 0):+.2f}%  "
-                f"dLoss={fg.get('delta_pressure_loss_pct', 0):+.2f}%"
+                f"  PSO:  dThrust={fg.get('delta_thrust_N_pct', 0):+.2f}%  "
+                f"dMach={fg.get('delta_exit_mach_pct', 0):+.2f}%"
             )
         print(sep)
 
-    # Pareto knee
     if mo and "best_pareto_knee" in mo:
         knee = mo["best_pareto_knee"]
         p = knee.get("params", {})
@@ -1040,7 +1027,6 @@ def main() -> None:
         print(f"  Pareto front : {pf} / {nc} candidates")
         print(sep)
 
-    # RANS candidates
     rc = summary.get("rans_candidates", {})
     if rc:
         ok_r = {k: v for k, v in rc.items() if v.get("status") == "ok"}
@@ -1048,8 +1034,7 @@ def main() -> None:
         for k, v in ok_r.items():
             print(
                 f"    {k}  F={v.get('thrust_N', 0):.3f} N  "
-                f"Isp={v.get('Isp_s', 0):.1f} s  "
-                f"loss={v.get('pressure_loss', 0):.5f}"
+                f"Isp={v.get('Isp_s', 0):.1f} s"
             )
         print(sep)
 

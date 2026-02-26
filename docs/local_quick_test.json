@@ -38,16 +38,16 @@
         0.18,
         0.26
       ],
-      "shape": [
-        1.3,
-        2.2
+      "straighten_frac": [
+        0.30,
+        0.70
       ]
     },
     "population": 6,
     "generations": 2,
     "sigma": 0.12,
     "n_points": 120,
-    "profile": "bezier_like",
+    "profile": "mln",
     "w_thrust": 0.7,
     "w_pressure_loss": 0.3,
     "n_workers": 1,

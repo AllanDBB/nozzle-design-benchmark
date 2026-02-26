@@ -6,22 +6,22 @@ import pytest
 
 from evaluators import EvaluationResult
 from evaluators.OpenFOAMRANSEvaluator import OpenFOAMRANSEvaluator
-from geometry import NozzleGeometry
+from geometry import NozzleGeometry, MinimumLengthNozzle
 from optimization import Optimizer
 
 
 def _geom() -> NozzleGeometry:
-    return NozzleGeometry.fromParams(
-        {
-            "throat_radius": 0.02,
-            "exit_radius": 0.06,
-            "length": 0.22,
-            "n_points": 41,
-            "profile": "bezier_like",
-            "shape": 1.8,
-            "metadata": {"id": "unit_geom"},
-        }
+    mln = MinimumLengthNozzle(
+        mach_exit=2.3,
+        throat_radius=0.02,
+        exit_radius=0.06,
+        length=0.22,
+        gamma=1.4,
+        n_points=41,
     )
+    geom = mln.build()
+    geom.metadata["id"] = "unit_geom"
+    return geom
 
 
 def _eval(tmp_path: Path, **cfg) -> OpenFOAMRANSEvaluator:

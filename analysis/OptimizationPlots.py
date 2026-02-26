@@ -6,7 +6,7 @@ import math
 
 import matplotlib.pyplot as plt
 
-from geometry import NozzleGeometry
+from geometry import NozzleGeometry, MinimumLengthNozzle
 
 
 def _draw_char_lines(
@@ -96,7 +96,6 @@ def generate_optimization_plots(
     moc_geometry: Optional[NozzleGeometry] = None,
     throat_radius: Optional[float] = None,
     n_points: int = 180,
-    profile: str = "bezier_like",
     gamma: float = 1.4,
     gas_constant: float = 287.0,
     mach_exit: float = 2.0,
@@ -269,16 +268,16 @@ def generate_optimization_plots(
                 continue
             if not all(k in params for k in ("exit_radius", "length")):
                 continue
-            geom = NozzleGeometry.fromParams(
-                {
-                    "throat_radius": float(throat_radius),
-                    "exit_radius": float(params["exit_radius"]),
-                    "length": float(params["length"]),
-                    "n_points": int(n_points),
-                    "profile": profile,
-                    "shape": float(params.get("shape", 1.8)),
-                }
+            _mln = MinimumLengthNozzle(
+                mach_exit=mach_exit,
+                throat_radius=float(throat_radius),
+                exit_radius=float(params["exit_radius"]),
+                length=float(params["length"]),
+                gamma=gamma,
+                n_points=int(n_points),
+                straighten_frac=float(params.get("straighten_frac", 0.45)),
             )
+            geom = _mln.build()
             xg = [p[0] for p in geom.control_points]
             yg = [p[1] for p in geom.control_points]
             _lbl = f"best@{m+1} (cand {idx+1})"
