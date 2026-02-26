@@ -344,11 +344,11 @@ class MOCSolver:
             try:
                 a_j = self._axis_point(prev_cm)
                 if a_j.x < prev_cm.x - 1e-10 or a_j.nu < 0:
-                    break
+                    continue
                 axis2[j] = a_j
                 last_cp2[j] = a_j
             except Exception:
-                break
+                continue
 
         return {
             "fan":       fan,
@@ -528,10 +528,15 @@ class MOCSolver:
         raw_L  = wall_pts[-1].x if wall_pts else 1.0
         raw_ye = wall_pts[-1].y if wall_pts else y_t + 1e-3
         sx = L / max(raw_L, 1e-12)
-        sy = (y_e - y_t) / max(raw_ye - y_t, 1e-12)
+        # Piecewise y-scaling so that:  axis(0)→0,  throat(y_t)→y_t,  exit→y_e
+        #   Below throat: interior & axis points — no y change needed.
+        #   Above throat: wall points stretched to [y_t, y_e].
+        sy_above = (y_e - y_t) / max(raw_ye - y_t, 1e-12)
 
         def scale(p: _MeshPoint) -> Tuple[float, float]:
-            return (p.x * sx, y_t + (p.y - y_t) * sy)
+            if p.y <= y_t:
+                return (p.x * sx, p.y)
+            return (p.x * sx, y_t + (p.y - y_t) * sy_above)
 
         # -- Figure --------------------------------------------------------
         fig, ax = plt.subplots(figsize=(12, 5.0))
@@ -551,9 +556,12 @@ class MOCSolver:
         ax.plot([0, L], [0, 0], color="black", linewidth=0.7,
                 linestyle="-", zorder=3)
 
+        # Fan origin — snap to geometry throat so lines start on the wall
+        fan_origin = (0.0, y_t)
+
         # ---- 2) C- fan: corner -> internal -> axis -----------------------
         for j in range(N):
-            path_xy: List[Tuple[float, float]] = [scale(corner)]
+            path_xy: List[Tuple[float, float]] = [fan_origin]
             for i in range(j):
                 if (i, j) in interior:
                     path_xy.append(scale(interior[(i, j)]))
@@ -567,103 +575,11 @@ class MOCSolver:
             for j in range(i + 1, N):
                 if (i, j) in interior:
                     path_xy.append(scale(interior[(i, j)]))
-            path_xy.append(scale(wall_pts[i]))
+            # Snap endpoint to geometry wall so it visually touches it
+            wx_i = wall_pts[i].x * sx
+            path_xy.append((min(wx_i, L), geometry.y_at(min(wx_i, L))))
             ax.plot([p[0] for p in path_xy], [p[1] for p in path_xy],
                     color=char_color, linewidth=lw_char, zorder=2)
-
-        # ---- 3b-3c) Wall-reflected characteristic network ----------------
-        # Characteristics reflect off the wall (C- wall→axis) and the axis
-        # (C+ axis→wall).  All lines are clipped at the nozzle exit plane.
-        raw_L_mesh = wall_pts[-1].x if wall_pts else 1.0
-        n_refl = sum(1 for a in axis2_pts if a is not None)
-
-        # Wall-contour interpolator for C+→wall intersection
-        _wall_xy = [(0.0, y_t)]
-        for _wp in wall_pts:
-            if _wp.x > _wall_xy[-1][0]:
-                _wall_xy.append((_wp.x, _wp.y))
-
-        def _wall_y_at(xq: float) -> float:
-            for _k in range(len(_wall_xy) - 1):
-                x0w, y0w = _wall_xy[_k]
-                x1w, y1w = _wall_xy[_k + 1]
-                if x0w <= xq <= x1w:
-                    _t = (xq - x0w) / (x1w - x0w) if x1w > x0w else 0.0
-                    return y0w + _t * (y1w - y0w)
-            return _wall_xy[-1][1]
-
-        def _clip_path(raw_pts: list, x_max: float):
-            """Clip _MeshPoints at x=x_max and return scaled (x,y)."""
-            out: List[Tuple[float, float]] = []
-            for _k, _pt in enumerate(raw_pts):
-                if _pt.x <= x_max + 1e-10:
-                    out.append(scale(_pt))
-                else:
-                    if _k > 0:
-                        _prev = raw_pts[_k - 1]
-                        _dx = _pt.x - _prev.x
-                        if _dx > 1e-14:
-                            _t = (x_max - _prev.x) / _dx
-                            _ix = _prev.x + _t * (_pt.x - _prev.x)
-                            _iy = _prev.y + _t * (_pt.y - _prev.y)
-                            out.append(scale(_MeshPoint(x=_ix, y=_iy)))
-                    break
-            return out
-
-        # 3b) C- reflected from wall → interior2 → axis2  (clipped)
-        for j in range(n_refl):
-            rp: list = [wall_pts[j]]
-            for i in range(j):
-                if (i, j) in interior2:
-                    rp.append(interior2[(i, j)])
-            if axis2_pts[j] is not None:
-                rp.append(axis2_pts[j])
-            pxy = _clip_path(rp, raw_L_mesh)
-            if len(pxy) > 1:
-                ax.plot([p[0] for p in pxy], [p[1] for p in pxy],
-                        color=char_color, linewidth=lw_char, zorder=2)
-
-        # 3c) C+ reflected from axis2 → interior2 → wall  (clipped)
-        for i in range(n_refl):
-            a2i = axis2_pts[i]
-            if a2i is None or a2i.x > raw_L_mesh:
-                continue
-            rp = [a2i]
-            for j in range(i + 1, n_refl):
-                if (i, j) in interior2:
-                    rp.append(interior2[(i, j)])
-            # Extend C+ from last mesh point to the wall contour or exit
-            last = rp[-1]
-            if last.x < raw_L_mesh - 1e-10:
-                s_cp = math.tan(last.theta + last.mu)
-                if abs(s_cp) > 1e-10:
-                    # Search for x where C+ line meets the wall contour
-                    x_hit = raw_L_mesh
-                    n_steps = 200
-                    for _step in range(1, n_steps + 1):
-                        xt = last.x + (raw_L_mesh - last.x) * _step / n_steps
-                        yl = last.y + s_cp * (xt - last.x)
-                        yw = _wall_y_at(xt)
-                        if yl >= yw:
-                            # Bisect for exact crossing
-                            xlo = last.x + (raw_L_mesh - last.x) * (_step - 1) / n_steps
-                            xhi = xt
-                            for _ in range(30):
-                                xm = 0.5 * (xlo + xhi)
-                                if last.y + s_cp * (xm - last.x) < _wall_y_at(xm):
-                                    xlo = xm
-                                else:
-                                    xhi = xm
-                            x_hit = 0.5 * (xlo + xhi)
-                            break
-                    end_y = last.y + s_cp * (x_hit - last.x)
-                    rp.append(_MeshPoint(x=x_hit, y=max(0.0, end_y)))
-                else:
-                    rp.append(_MeshPoint(x=raw_L_mesh, y=last.y))
-            pxy = _clip_path(rp, raw_L_mesh)
-            if len(pxy) > 1:
-                ax.plot([p[0] for p in pxy], [p[1] for p in pxy],
-                        color=char_color, linewidth=lw_char, zorder=2)
 
         # ---- 4) Sonic line (arc at throat) -------------------------------
         n_arc = 50

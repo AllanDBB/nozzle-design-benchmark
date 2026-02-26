@@ -162,7 +162,7 @@ def default_config() -> Dict[str, Any]:
                 "overexpanded_wall_rms_penalty": 0.03,
             },
             # MOC characteristic lines on nozzle plots
-            "n_char_lines": 50,
+            "n_char_lines": 80,
         },
     }
 

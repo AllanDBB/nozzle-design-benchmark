@@ -469,53 +469,68 @@ def _overlay_char_lines(
     alpha: float = 0.12,
     color: str = "tab:blue",
 ) -> None:
-    """Lightweight C+ characteristic overlay on an existing axes."""
-    x_end = geometry.length
-    throat = geometry.throat_radius
-    n_steps = max(n_lines * 10, 200)
-    xs_fine = [i * x_end / n_steps for i in range(n_steps + 1)]
+    """Overlay actual MOC characteristic network on an existing axes.
 
-    def _mach_sup(ar: float) -> float:
-        if ar <= 1.0:
-            return 1.0
-        lo, hi = 1.0, 20.0
-        gm1 = gamma - 1.0
-        gp1 = gamma + 1.0
-        for _ in range(50):
-            mid = 0.5 * (lo + hi)
-            fac = 1.0 + gm1 / 2.0 * mid * mid
-            a = (2.0 / gp1 * fac) ** (gp1 / (2.0 * gm1)) / mid
-            if a > ar:
-                lo = mid
-            else:
-                hi = mid
-        return 0.5 * (lo + hi)
+    Uses :class:`MOCSolver.computeMesh` to obtain the real C-/C+
+    intersection lattice, then draws each characteristic path scaled
+    to the supplied *geometry* dimensions.
+    """
+    solver = MOCSolver(
+        machExit=mach_exit,
+        pressureRatio=0.08,   # doesn't affect the mesh
+        gamma=gamma,
+        nCharacteristics=n_lines,
+    )
+    y_t = geometry.throat_radius
+    mesh = solver.computeMesh(y_t)
 
-    for j in range(n_lines):
-        x0 = j * x_end / max(n_lines - 1, 1)
-        yw0 = geometry.y_at(x0)
-        ar0 = (yw0 / max(throat, 1e-9)) ** 2
-        m0 = _mach_sup(max(ar0, 1.0))
-        mu0 = math.asin(min(1.0, 1.0 / max(m0, 1.001)))
-        dyw = (geometry.y_at(min(x0 + 1e-4, x_end))
-               - geometry.y_at(max(x0 - 1e-4, 0.0))) / 2e-4
-        theta0 = math.atan(max(dyw, 0.0))
-        slope = math.tan(theta0 + mu0)
-        rx = [x0]
-        ry = [0.0]
-        for x in xs_fine:
-            if x <= x0:
-                continue
-            y = slope * (x - x0)
-            yw = geometry.y_at(x)
-            if y >= yw:
-                rx.append(x)
-                ry.append(yw)
-                break
-            rx.append(x)
-            ry.append(y)
-        if len(rx) > 1:
-            ax.plot(rx, ry, color=color, alpha=alpha, linewidth=0.5, zorder=2)
+    N        = mesh["N"]
+    corner   = mesh["corner"]
+    axis_pts = mesh["axis"]
+    interior = mesh["interior"]
+    wall_pts = mesh["wall"]
+
+    # Scale raw mesh coordinates to match geometry dimensions
+    L   = geometry.length
+    y_e = geometry.exit_radius
+    raw_L  = wall_pts[-1].x if wall_pts else 1.0
+    raw_ye = wall_pts[-1].y if wall_pts else y_t + 1e-3
+    sx = L / max(raw_L, 1e-12)
+    sy_above = (y_e - y_t) / max(raw_ye - y_t, 1e-12)
+
+    def sc(p):
+        if p.y <= y_t:
+            return (p.x * sx, p.y)
+        return (p.x * sx, y_t + (p.y - y_t) * sy_above)
+
+    fan_origin = (0.0, y_t)                # snap to geometry throat
+
+    # C- fan: corner → interior → axis
+    for j in range(N):
+        path = [fan_origin]
+        for i in range(j):
+            if (i, j) in interior:
+                path.append(sc(interior[(i, j)]))
+        if axis_pts[j] is not None:
+            path.append(sc(axis_pts[j]))
+        if len(path) >= 2:
+            ax.plot([p[0] for p in path], [p[1] for p in path],
+                    color=color, alpha=alpha, linewidth=0.5, zorder=2)
+
+    # C+ reflected: axis → interior → wall
+    for i in range(N):
+        if axis_pts[i] is None:
+            continue
+        path = [sc(axis_pts[i])]
+        for j in range(i + 1, N):
+            if (i, j) in interior:
+                path.append(sc(interior[(i, j)]))
+        if i < len(wall_pts):
+            wx_i = wall_pts[i].x * sx
+            path.append((min(wx_i, L), geometry.y_at(min(wx_i, L))))
+        if len(path) >= 2:
+            ax.plot([p[0] for p in path], [p[1] for p in path],
+                    color=color, alpha=alpha, linewidth=0.5, zorder=2)
 
 
 # ====================================================================== #
