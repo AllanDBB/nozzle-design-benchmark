@@ -199,8 +199,20 @@ def _write_run_meta(out_dir: Path, config: Dict[str, Any], backend: str) -> None
     )
 
 
-def _docker_available() -> bool:
-    """Check if Docker daemon is reachable (needed for OpenFOAM RANS)."""
+def _openfoam_available() -> bool:
+    """Check if OpenFOAM is reachable — natively or via Docker."""
+    # 1) Native install (e.g. inside the project Docker image)
+    try:
+        r = subprocess.run(
+            ["bash", "-lc",
+             "source /opt/openfoam13/etc/bashrc 2>/dev/null; command -v blockMesh"],
+            capture_output=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return True
+    except Exception:
+        pass
+    # 2) Fallback: Docker daemon available (Docker-in-Docker)
     try:
         r = subprocess.run(
             ["docker", "info"],
@@ -344,8 +356,8 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
 
     # Determine if RANS is actually available
     run_rans = backend == "openfoam"
-    if run_rans and not _docker_available():
-        _log("WARNING: backend=openfoam but Docker not available -- RANS disabled", t0)
+    if run_rans and not _openfoam_available():
+        _log("WARNING: backend=openfoam but OpenFOAM not available -- RANS disabled", t0)
         run_rans = False
 
     # ==================================================================

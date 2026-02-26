@@ -1,7 +1,8 @@
 """Ensemble Meta-Optimiser — runs multiple CI algorithms and merges results.
 
-Runs PSO, MOPSO-Lévy, and Firefly in sequence (or user-selected subset),
-then merges all candidate histories and selects the overall best.
+Runs up to four swarm-intelligence algorithms in sequence (or a
+user-selected subset), merges all candidate histories, and selects the
+overall best via 3-objective Pareto dominance.
 
 This is the "make it fly" module: each algorithm explores the design space
 with different dynamics, and the ensemble picks the winner.
@@ -9,12 +10,19 @@ with different dynamics, and the ensemble picks the winner.
 Supported algorithms
 --------------------
   pso       — Standard PSO with adaptive inertia (SwarmOptimizer)
-  mopso_lf  — Multi-Objective PSO with Lévy flights (MOPSO)
+  mopso_lf  — Multi-Objective PSO with Lévy flights, 3 objectives (MOPSO)
   firefly   — Firefly Algorithm with Lévy perturbation
+  abc       — Artificial Bee Colony with Pareto archive, 3 objectives
+
+Multi-objective selection
+------------------------
+The winner is chosen by 3-objective Pareto dominance (thrust ↑,
+pressure_loss ↓, nozzle_length ↓) with a scalarised tie-break.
 
 Usage
 -----
-    runner = EnsembleRunner(searchSpace=..., objectiveFunc=..., algorithms=["pso", "mopso_lf", "firefly"])
+    runner = EnsembleRunner(searchSpace=..., objectiveFunc=...,
+                            algorithms=["pso", "mopso_lf", "firefly", "abc"])
     result = runner.run()
     runner.summary()
 """
@@ -26,6 +34,24 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from evaluators import EvaluationResult
+
+
+# ====================================================================== #
+#  Pareto dominance helper                                                 #
+# ====================================================================== #
+
+def _dominates_objs(a: Dict[str, float], b: Dict[str, float],
+                    objectives: List[str], directions: List[int]) -> bool:
+    """True if *a* Pareto-dominates *b*. direction=+1 maximise, -1 minimise."""
+    dom = False
+    for obj, d in zip(objectives, directions):
+        va = d * a.get(obj, 0.0)
+        vb = d * b.get(obj, 0.0)
+        if va < vb:
+            return False
+        if va > vb:
+            dom = True
+    return dom
 
 
 # ====================================================================== #
@@ -42,10 +68,12 @@ def _ensure_registry():
     from optimization.SwarmOptimizer import SwarmOptimizer
     from optimization.MOPSO import MOPSOOptimizer
     from optimization.FireflyOptimizer import FireflyOptimizer
+    from optimization.ABCOptimizer import ABCOptimizer
     _REGISTRY = {
         "pso": SwarmOptimizer,
         "mopso_lf": MOPSOOptimizer,
         "firefly": FireflyOptimizer,
+        "abc": ABCOptimizer,
     }
 
 
@@ -92,7 +120,7 @@ class EnsembleRunner:
 
     searchSpace: Dict[str, Any]
     objectiveFunc: Callable[[Dict[str, float]], EvaluationResult]
-    algorithms: List[str] = field(default_factory=lambda: ["pso", "mopso_lf", "firefly"])
+    algorithms: List[str] = field(default_factory=lambda: ["pso", "mopso_lf", "firefly", "abc"])
     seed: int = 42
 
     # Outputs
@@ -172,11 +200,38 @@ class EnsembleRunner:
         if not self._algo_results:
             raise RuntimeError("EnsembleRunner: all algorithms failed")
 
-        # Select overall best (max thrust as primary, min loss to break ties)
-        overall_best_ar = max(
-            self._algo_results,
-            key=lambda a: (float(a.best_result.thrust), -float(a.best_result.pressureLoss)),
+        # Select overall best via Pareto dominance across all algorithm bests.
+        # Among non-dominated candidates, pick by weighted scalarisation.
+        bests = [
+            {
+                "thrust": float(a.best_result.thrust),
+                "pressure_loss": float(a.best_result.pressureLoss),
+                "nozzle_length": float(a.best_params.get("length", 0.0)),
+                "idx": i,
+            }
+            for i, a in enumerate(self._algo_results)
+        ]
+        obj_names = ["thrust", "pressure_loss", "nozzle_length"]
+        obj_dirs = [+1, -1, -1]
+        nondom = []
+        for i, bi in enumerate(bests):
+            dominated = any(
+                _dominates_objs(bj, bi, obj_names, obj_dirs)
+                for j, bj in enumerate(bests) if j != i
+            )
+            if not dominated:
+                nondom.append(bi)
+        if not nondom:
+            nondom = bests
+        # Scalarised tie-break among non-dominated
+        wt = float(self.searchSpace.get("w_thrust", 0.7))
+        wl = float(self.searchSpace.get("w_pressure_loss", 0.3))
+        winner_entry = max(
+            nondom,
+            key=lambda b: wt * b["thrust"] - wl * b["pressure_loss"] * 1e3
+                          - 0.1 * b["nozzle_length"],
         )
+        overall_best_ar = self._algo_results[winner_entry["idx"]]
         self._best_algorithm = overall_best_ar.algorithm
         self._best_result = overall_best_ar.best_result
         self._best_params = dict(overall_best_ar.best_params)
@@ -184,6 +239,9 @@ class EnsembleRunner:
         self._best_result.metadata["ensemble_winner"] = self._best_algorithm
         self._best_result.metadata["ensemble_algorithms"] = self.algorithms
         self._best_result.metadata["best_params"] = dict(self._best_params)
+        self._best_result.metadata["nondominated_algorithms"] = [
+            self._algo_results[b["idx"]].algorithm for b in nondom
+        ]
 
         return self._best_result
 
@@ -273,35 +331,49 @@ class EnsembleRunner:
                 "algorithm": ar.algorithm,
                 "thrust_N": round(float(ar.best_result.thrust), 4),
                 "pressure_loss": round(float(ar.best_result.pressureLoss), 6),
+                "nozzle_length_mm": round(float(ar.best_params.get("length", 0.0)) * 1000, 1),
                 "n_evals": ar.n_evals,
                 "elapsed_s": ar.elapsed_s,
                 "params": ar.best_params,
             })
+        nondom_algos = []
+        if self._best_result and self._best_result.metadata:
+            nondom_algos = self._best_result.metadata.get("nondominated_algorithms", [])
         return {
             "algorithms_run": [ar.algorithm for ar in self._algo_results],
             "winner": self._best_algorithm,
             "winner_thrust_N": round(float(self._best_result.thrust), 4) if self._best_result else 0.0,
             "total_evaluations": self.total_evals,
+            "nondominated_algorithms": nondom_algos,
             "per_algorithm": rows,
         }
 
     def print_summary(self) -> None:
         """Print a formatted summary table."""
         s = self.summary()
-        sep = "-" * 72
+        sep = "-" * 80
         print(f"\n{sep}")
-        print("  ENSEMBLE CI RESULTS - ALGORITHM COMPARISON")
+        print("  ENSEMBLE CI RESULTS - ALGORITHM COMPARISON (3-objective Pareto)")
         print(sep)
-        hdr = f"  {'Algorithm':<14s}  {'Thrust [N]':>12s}  {'Loss':>10s}  {'Evals':>6s}  {'Time':>7s}"
+        hdr = (f"  {'Algorithm':<14s}  {'Thrust [N]':>12s}  {'Loss':>10s}  "
+               f"{'Length':>8s}  {'Evals':>6s}  {'Time':>7s}")
         print(hdr)
-        print(f"  {'-' * 14}  {'-' * 12}  {'-' * 10}  {'-' * 6}  {'-' * 7}")
+        print(f"  {'-' * 14}  {'-' * 12}  {'-' * 10}  {'-' * 8}  {'-' * 6}  {'-' * 7}")
+        nondom = s.get("nondominated_algorithms", [])
         for row in s["per_algorithm"]:
-            winner = " *" if row["algorithm"] == s["winner"] else ""
+            tag = ""
+            if row["algorithm"] == s["winner"]:
+                tag = " *"
+            elif row["algorithm"] in nondom:
+                tag = " ~"  # non-dominated but not winner
             print(
                 f"  {row['algorithm']:<14s}  {row['thrust_N']:>12.4f}  "
-                f"{row['pressure_loss']:>10.6f}  {row['n_evals']:>6d}  "
-                f"{row['elapsed_s']:>6.1f}s{winner}"
+                f"{row['pressure_loss']:>10.6f}  "
+                f"{row['nozzle_length_mm']:>7.1f}  "
+                f"{row['n_evals']:>6d}  "
+                f"{row['elapsed_s']:>6.1f}s{tag}"
             )
         print(sep)
-        print(f"  Winner: {s['winner']}  |  Total evals: {s['total_evaluations']}")
+        print(f"  Winner: {s['winner']}  |  Non-dominated: {', '.join(nondom)}")
+        print(f"  Total evals: {s['total_evaluations']}  |  (* = winner, ~ = Pareto non-dominated)")
         print(sep)

@@ -157,8 +157,8 @@ class MOPSOOptimizer:
 
     # ---- objective helpers ------------------------------------------------
 
-    _OBJ_NAMES = ["thrust", "pressure_loss"]
-    _OBJ_DIRS = [+1, -1]   # maximise thrust, minimise loss
+    _OBJ_NAMES = ["thrust", "pressure_loss", "nozzle_length"]
+    _OBJ_DIRS = [+1, -1, -1]   # maximise thrust, minimise loss, minimise length
 
     def _wt(self) -> float:
         return float(self.searchSpace.get("w_thrust", 0.7))
@@ -166,9 +166,12 @@ class MOPSOOptimizer:
     def _wl(self) -> float:
         return float(self.searchSpace.get("w_pressure_loss", 0.3))
 
-    def _scalar_score(self, thrust: float, loss: float) -> float:
+    def _scalar_score(self, thrust: float, loss: float,
+                      length: float = 0.0) -> float:
         """Weighted scalarisation (for single-best tracking only)."""
-        return self._wt() * thrust - self._wl() * loss * 1e3
+        length_ref = float(self.searchSpace.get("bounds", {}).get("length", [0.18, 0.28])[1])
+        length_penalty = 0.1 * (length / max(length_ref, 1e-9))
+        return self._wt() * thrust - self._wl() * loss * 1e3 - length_penalty
 
     # ---- search-space helpers ---------------------------------------------
 
@@ -293,7 +296,9 @@ class MOPSOOptimizer:
         swarm: List[_MOParticle] = []
         for pos, res in zip(init_positions, init_results):
             vel = {k: rng.uniform(-v_max[k], v_max[k]) for k in keys}
-            obj = {"thrust": float(res.thrust), "pressure_loss": float(res.pressureLoss)}
+            nozzle_len = float(pos.get("length", 0.0))
+            obj = {"thrust": float(res.thrust), "pressure_loss": float(res.pressureLoss),
+                   "nozzle_length": nozzle_len}
             swarm.append(_MOParticle(
                 position=dict(pos), velocity=vel,
                 best_position=dict(pos), best_objectives=dict(obj),
@@ -303,8 +308,9 @@ class MOPSOOptimizer:
 
         # Track best scalar score for diagnostics
         best_scalar = max(
-            self._scalar_score(float(r.thrust), float(r.pressureLoss))
-            for r in init_results
+            self._scalar_score(float(r.thrust), float(r.pressureLoss),
+                               float(p.get("length", 0.0)))
+            for r, p in zip(init_results, init_positions)
         )
         self._gbest_trace.append(best_scalar)
         self._inertia_trace.append(w_max)
@@ -358,7 +364,9 @@ class MOPSOOptimizer:
             iter_results = self._evaluate_batch(new_positions)
 
             for p, res in zip(swarm, iter_results):
-                obj = {"thrust": float(res.thrust), "pressure_loss": float(res.pressureLoss)}
+                nozzle_len = float(p.position.get("length", 0.0))
+                obj = {"thrust": float(res.thrust), "pressure_loss": float(res.pressureLoss),
+                       "nozzle_length": nozzle_len}
                 entry = {**p.position, **obj}
                 self._update_archive(entry)
 
@@ -373,8 +381,9 @@ class MOPSOOptimizer:
                         p.best_position = dict(p.position)
 
             sc = max(
-                self._scalar_score(float(r.thrust), float(r.pressureLoss))
-                for r in iter_results
+                self._scalar_score(float(r.thrust), float(r.pressureLoss),
+                                   float(p.position.get("length", 0.0)))
+                for r, p in zip(iter_results, swarm)
             )
             best_scalar = max(best_scalar, sc)
             self._gbest_trace.append(best_scalar)
@@ -405,6 +414,7 @@ class MOPSOOptimizer:
             key=lambda i: self._scalar_score(
                 float(self._history[i].thrust),
                 float(self._history[i].pressureLoss),
+                float(self._history_params[i].get("length", 0.0)),
             ),
         )
 

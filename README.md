@@ -1,11 +1,13 @@
 ﻿# nozzle-design-benchmark
 
-Framework computacional para comparar diseño de toberas supersónicas por tres enfoques:
+Framework computacional para diseño y optimización de toberas supersónicas convergente-divergente usando inteligencia de enjambre (Swarm Intelligence) y validación RANS con OpenFOAM.
 
 | Componente | Descripción |
 |---|---|
 | **MOC** | Geometría base por Método de las Características (referencia clásica) |
-| **Optimización** | Búsqueda paramétrica de geometría (random, GA) con evaluador quasi-1D o RANS |
+| **Optimización CI** | Ensemble de 4 algoritmos de inteligencia computacional: PSO, MOPSO-LF, Firefly, ABC |
+| **Multi-objetivo** | Frente de Pareto 3D (empuje ↑, pérdida de presión ↓, longitud ↓) con selección de rodilla |
+| **RANS** | Validación de alta fidelidad con OpenFOAM shockFluid para los diseños Pareto |
 | **Benchmark** | Comparación MOC vs optimizada con el mismo evaluador CFD |
 
 > Este proyecto es un framework de análisis computacional, no una GUI. Se ejecuta por terminal con archivos de configuración JSON.
@@ -38,15 +40,56 @@ python main_pipeline.py --config docs/local_quick_test.json
 ```
 Usa el evaluador quasi-1D. Ideal para desarrollo y verificación de cambios.
 
-### 2. RANS 2D con OpenFOAM — requiere Docker
+### 2. Ensemble CI (4 algoritmos) — sin Docker, ~30 segundos
+Corre los 4 algoritmos de swarm intelligence en modo rápido:
 ```bash
-# Una sola vez: construir imagen
-docker compose build
-
-# Correr pipeline completo con RANS 2D
-docker compose run --rm nozzle python3 main_pipeline.py --config docs/rans_2d_quick.json
+python main_ensemble_pipeline.py --quick
 ```
-Cada candidato tarda ~15-40 min dependiendo de la malla y convergencia.
+PSO + MOPSO-LF + Firefly + ABC compiten en un espacio de diseño 5D. Análisis Pareto tri-objetivo.
+
+### 3. Ensemble CI + RANS — requiere Docker, ~20-40 min
+Test de referencia: screening Q1D → validación RANS de frente de Pareto (rodilla + mejor-por-pérdida + top-empuje):
+```bash
+docker compose build                    # una sola vez
+docker compose run --rm nozzle python3 main_ensemble_pipeline.py \
+    --config docs/rans_2d_ensemble.json
+```
+
+### 4. RANS 2D con pipeline clásico (GA) — requiere Docker
+```bash
+docker compose run --rm nozzle python3 main_pipeline.py \
+    --config docs/rans_2d_quick.json
+```
+
+---
+
+## Pipelines disponibles
+
+| Pipeline | Archivo | Algoritmos | Descripción |
+|---|---|---|---|
+| **Clásico** | `main_pipeline.py` | Random / GA | Pipeline original con optimización evolutiva |
+| **Swarm** | `main_swarm_pipeline.py` | PSO | Pipeline con Particle Swarm Optimisation |
+| **Ensemble CI** | `main_ensemble_pipeline.py` | PSO + MOPSO-LF + Firefly + ABC | 4 algoritmos compiten, selección Pareto 3-objetivo |
+
+### Fases del Ensemble Pipeline
+1. **MOC Baseline** — Geometría de referencia por Prandtl-Meyer isentrópico
+2. **Ensemble CI Race** — Los 4 algoritmos exploran el espacio 5D con evaluador Q1D
+3. **RANS Validation** — OpenFOAM shockFluid en: MOC, CI-best, rodilla Pareto, mejor-por-pérdida, top-K
+4. **Multi-fidelity Table** — Comparación Q1D vs RANS con gap de fidelidad
+5. **Plots + Benchmark** — Diagramas comparativos, frente de Pareto, radar, heatmaps
+
+### Algoritmos de Inteligencia Computacional
+
+| Algoritmo | Módulo | Tipo | Objetivos |
+|---|---|---|---|
+| **PSO** | `SwarmOptimizer.py` | Single-objective | Empuje (escalar) |
+| **MOPSO-LF** | `MOPSO.py` | Multi-objetivo (Pareto) | Empuje ↑, pérdida ↓, longitud ↓ |
+| **Firefly** | `FireflyOptimizer.py` | Single-objective | Empuje (escalar) |
+| **ABC** | `ABCOptimizer.py` | Multi-objetivo (Pareto) | Empuje ↑, pérdida ↓, longitud ↓ |
+
+**MOPSO-LF**: Lévy flights para saltar óptimos locales, archivo externo con crowding distance (NSGA-II), factor de constricción χ.
+
+**ABC** (Artificial Bee Colony): Abejas empleadas explotan fuentes conocidas, abejas observadoras seleccionan proporcionalmente al fitness (roulette-wheel), abejas exploradoras abandonan fuentes agotadas con vuelos Lévy. Archivo Pareto compartido.
 
 ---
 
@@ -54,19 +97,21 @@ Cada candidato tarda ~15-40 min dependiendo de la malla y convergencia.
 
 Los resultados se guardan en `out/<nombre_del_caso>/`, configurado por `out_dir` en el JSON.
 
+### Archivos de salida (ensemble pipeline)
+
 | Archivo | Contenido |
 |---|---|
-| `summary.json` | Estado, paths, comparación resumida |
-| `comparison.json` | Delta de empuje y pérdida de presión MOC vs optimizada |
-| `report.md` / `report.json` | Reporte completo con todos los métricas |
-| `moc_geometry.csv` | Puntos de control de la geometría MOC |
-| `optimized_geometry.csv` | Puntos de control de la geometría optimizada |
-| `moc_characteristics.png` | Líneas características MOC |
-| `optimization_thrust_history.png` | Convergencia del empuje durante optimización |
-| `optimization_pressure_loss_history.png` | Convergencia de pérdida de presión |
-| `optimization_best_so_far_*.png` | Evolución del mejor candidato (Mach, velocidad, geometría) |
-| `compare_*.png` | Comparación MOC vs optimizada (geometría, Mach, velocidad, presión, temperatura, performance) |
-| `multiobjective/pareto_*.png` | Frente de Pareto (si hay ≥2 candidatos) |
+| `summary.json` | Estado, paths, comparación, fidelity table, Pareto |
+| `report.md` / `report.json` | Reporte completo con todas las métricas |
+| `ensemble/ensemble_summary.json` | Resultados por algoritmo, ganador, Pareto |
+| `ensemble/multiobjective/` | Frente de Pareto, rodilla, ranking por score |
+| `rans/` | Resultados RANS de cada candidato validado |
+| `comp/fidelity_table.json` | Tabla multi-fidelidad Q1D vs RANS |
+| `moc/moc_characteristics.png` | Red de líneas características MOC |
+| `ensemble/<algo>/` | Plots de convergencia por algoritmo |
+| `ensemble/ensemble_*.png` | Comparación entre algoritmos (radar, heatmap, etc.) |
+| `comp/compare_*.png` | Comparación MOC vs optimizada |
+| `ensemble/multiobjective/pareto_*.png` | Gráficos del frente de Pareto |
 
 ---
 
@@ -74,13 +119,14 @@ Los resultados se guardan en `out/<nombre_del_caso>/`, configurado por `out_dir`
 
 ### Configs disponibles
 
-| Archivo | Backend | Duración estimada | Uso |
-|---|---|---|---|
-| `docs/local_quick_test.json` | quasi-1D | ~5 s | Verificación local, sin Docker |
-| `docs/rans_2d_quick.json` | OpenFOAM 2D | ~10-20 min | Smoke estricto RANS |
-| `docs/design_supersonic.json` | OpenFOAM 2D | ~2-6 h | Campaña de diseño (casi shock-free) |
-| `docs/overexpanded_sea_level.json` | OpenFOAM 2D | ~2-6 h | Campaña sobreexpandida (choque interno) |
-| `docs/rans_2d_nightly_smoke.json` | OpenFOAM 2D | ~15-40 min | Smoke nightly CI |
+| Archivo | Pipeline | Backend | Duración estimada | Uso |
+|---|---|---|---|---|
+| `local_quick_test.json` | Clásico | quasi-1D | ~5 s | Verificación local, sin Docker |
+| `rans_2d_quick.json` | Clásico | OpenFOAM 2D | ~10-20 min | Smoke RANS rápido |
+| `rans_2d_ensemble.json` | Ensemble CI | OpenFOAM 2D | ~20-40 min | **4 algoritmos + RANS Pareto** |
+| `design_supersonic.json` | Clásico | OpenFOAM 2D | ~2-6 h | Campaña de diseño (casi shock-free) |
+| `overexpanded_sea_level.json` | Clásico | OpenFOAM 2D | ~2-6 h | Campaña sobreexpandida |
+| `rans_2d_nightly_smoke.json` | Clásico | OpenFOAM 2D | ~15-40 min | Smoke nightly CI |
 
 ### Bloque `moc`
 ```json
@@ -264,47 +310,63 @@ Ajustes típicos para estabilizar:
 ## Arquitectura del proyecto
 
 ```
-main_pipeline.py          ← único entrypoint
+main_pipeline.py              ← Pipeline clásico (Random/GA)
+main_swarm_pipeline.py        ← Pipeline PSO
+main_ensemble_pipeline.py     ← Pipeline ensemble CI (4 algoritmos)
 │
 ├── geometry/
-│   ├── MOCSolver.py      ← Genera geometría MOC
-│   └── NozzleGeometry.py ← Representación y export de geometría
+│   ├── MOCSolver.py          ← Genera geometría MOC
+│   ├── NozzleGeometry.py     ← Representación y export de geometría
+│   └── MinimumLengthNozzle.py ← Tobera de longitud mínima (MLN)
 │
 ├── evaluators/
 │   ├── CFDSimulation.py          ← Solver quasi-1D vectorizado (NumPy/CuPy)
-│   ├── OpenFOAMRANSEvaluator.py  ← Wrapper Docker + shockFluid + muestreo CFD real
+│   ├── OpenFOAMRANSEvaluator.py  ← OpenFOAM nativo (shockFluid) + muestreo CFD
 │   ├── EvaluationResult.py       ← Resultado de evaluación
 │   └── FastEvaluator.py          ← Evaluador heurístico (screening)
 │
 ├── optimization/
-│   ├── Optimizer.py        ← Random / GA + multi-objetivo Pareto
-│   └── OptimizationRunner.py
+│   ├── Optimizer.py          ← Random / GA + multi-objetivo Pareto
+│   ├── OptimizationRunner.py ← Runner para pipeline clásico
+│   ├── SwarmOptimizer.py     ← PSO con inercia adaptativa
+│   ├── MOPSO.py              ← MOPSO con Lévy flights (3 objetivos)
+│   ├── FireflyOptimizer.py   ← Firefly Algorithm
+│   ├── ABCOptimizer.py       ← Colonia Artificial de Abejas (3 objetivos)
+│   └── EnsembleRunner.py     ← Meta-optimizador ensemble (4 algoritmos)
 │
 ├── benchmarks/
-│   └── BenchmarkSuite.py   ← MOC vs optimizada con el mismo evaluador
+│   └── BenchmarkSuite.py     ← MOC vs optimizada con el mismo evaluador
 │
 ├── analysis/
 │   ├── OptimizationPlots.py  ← Plots de convergencia
 │   ├── ComparisonPlots.py    ← Plots MOC vs OPT
+│   ├── SwarmPlots.py         ← Plots de enjambre (PSO/ABC/Firefly)
+│   ├── EnsemblePlots.py      ← Plots comparativos ensemble
 │   └── AnalysisNote.py       ← Generador de reporte markdown/JSON
 │
-└── scripts/
-    └── multiobjective_rank.py  ← Análisis Pareto post-optimización
+├── scripts/
+│   └── multiobjective_rank.py ← Análisis Pareto + rodilla + ranking
+│
+└── docs/
+    └── *.json                 ← Configs de referencia
 ```
 
 ---
 
 ## Tiempos de referencia
 
-| Config | Backend | Malla | n_samples | Tiempo estimado |
+| Config | Pipeline | Backend | Malla | Tiempo estimado |
 |---|---|---|---|---|
-| `local_quick_test.json` | quasi-1D | — | 5 | ~5 s |
-| `rans_2d_quick.json` | OpenFOAM 2D | 80×36 | 3 | ~10-20 min |
-| `design_supersonic.json` | OpenFOAM 2D | 120×54 | 24 (high-fidelity) | ~2-6 h |
-| `overexpanded_sea_level.json` | OpenFOAM 2D | 160×72 | 24 (high-fidelity) | ~2-6 h |
+| `local_quick_test.json` | Clásico | quasi-1D | — | ~5 s |
+| `main_ensemble --quick` | Ensemble CI | quasi-1D | — | ~30 s |
+| `rans_2d_quick.json` | Clásico | OpenFOAM 2D | 80×36 | ~10-20 min |
+| `rans_2d_ensemble.json` | Ensemble CI | OpenFOAM 2D | 100×45 | ~20-40 min |
+| `design_supersonic.json` | Clásico | OpenFOAM 2D | 120×54 | ~2-6 h |
+| `overexpanded_sea_level.json` | Clásico | OpenFOAM 2D | 160×72 | ~2-6 h |
 
-> Con `n_workers > 1` en quasi-1D el tiempo escala casi linealmente (4 workers ≈ 4× más rápido).  
-> Con OpenFOAM RANS dejar `n_workers: 1` — cada run ocupa todos los cores disponibles.
+> Con quasi-1D y `n_workers > 1`, el tiempo escala casi linealmente (4 workers ≈ 4× más rápido).  
+> Con OpenFOAM RANS dejar `n_workers: 1` — cada run ocupa todos los cores disponibles.  
+> El ensemble CI corre los 4 algoritmos secuencialmente; cada uno usa swarm Q1D (rápido), luego solo los mejores se validan con RANS.
 
 ---
 

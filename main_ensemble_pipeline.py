@@ -1,11 +1,17 @@
 """Multi-Algorithm Computational Intelligence Pipeline for Nozzle Design.
 
-A "make it fly" ensemble pipeline that races three swarm-intelligence
+A "make it fly" ensemble pipeline that races four swarm-intelligence
 algorithms against each other:
 
   - **PSO**       — Standard Particle Swarm Optimisation
-  - **MOPSO-LF**  — Multi-Objective PSO with Lévy Flights
+  - **MOPSO-LF**  — Multi-Objective PSO with Lévy Flights (3 objectives)
   - **Firefly**   — Firefly Algorithm with Lévy perturbation
+  - **ABC**       — Artificial Bee Colony with Pareto archive (3 objectives)
+
+Multi-objective optimisation uses three objectives:
+  1. Thrust      (maximise)
+  2. Pressure loss (minimise)
+  3. Nozzle length (minimise — shorter = lighter)
 
 The pipeline expands the design space to 5D (exit_radius, length,
 straighten_frac, ramp_power, throat_angle_deg) and produces rich
@@ -14,8 +20,8 @@ comparative visualisations.
 Pipeline phases
 ---------------
 Phase 1 — MOC Baseline       (2-D planar Prandtl-Meyer isentropic)
-Phase 2 — Ensemble CI Race   (PSO + MOPSO-LF + Firefly, Q1D evaluator)
-Phase 3 — RANS Validation    (OpenFOAM shockFluid, if Docker available)
+Phase 2 — Ensemble CI Race   (PSO + MOPSO-LF + Firefly + ABC, Q1D evaluator)
+Phase 3 — RANS Validation    (OpenFOAM shockFluid, if available)
 Phase 4 — Multi-fidelity Comparison Table
 Phase 5 — Comparative Plots + MLN characteristic lines
 """
@@ -138,7 +144,7 @@ def default_config() -> Dict[str, Any]:
         },
         # ---- Ensemble CI Optimisation (5D design space) ----
         "optimization": {
-            "algorithms": ["pso", "mopso_lf", "firefly"],
+            "algorithms": ["pso", "mopso_lf", "firefly", "abc"],
             "seed": 42,
             # 5D design space
             "bounds": {
@@ -169,6 +175,10 @@ def default_config() -> Dict[str, Any]:
             "gamma_fa": 1.0,
             "alpha_fa": 0.25,
             "chaos_k": 5,
+            # ABC-specific
+            "colony_size": 30,
+            "limit": 0,
+            "onlooker_ratio": 1.0,
             # Multi-objective weights
             "w_thrust": 0.7,
             "w_pressure_loss": 0.3,
@@ -247,7 +257,18 @@ def _write_run_meta(out_dir: Path, config: Dict[str, Any], backend: str) -> None
     )
 
 
-def _docker_available() -> bool:
+def _openfoam_available() -> bool:
+    """Check if OpenFOAM is reachable — natively or via Docker."""
+    try:
+        r = subprocess.run(
+            ["bash", "-lc",
+             "source /opt/openfoam13/etc/bashrc 2>/dev/null; command -v blockMesh"],
+            capture_output=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return True
+    except Exception:
+        pass
     try:
         r = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
         return r.returncode == 0
@@ -369,8 +390,8 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     run_rans = backend == "openfoam"
-    if run_rans and not _docker_available():
-        _log("WARNING: backend=openfoam but Docker not available — RANS disabled", t0)
+    if run_rans and not _openfoam_available():
+        _log("WARNING: backend=openfoam but OpenFOAM not available — RANS disabled", t0)
         run_rans = False
 
     # ==================================================================
@@ -436,7 +457,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     # PHASE 2 — Ensemble CI Race
     # ==================================================================
     _log("=" * 60, t0)
-    _log("PHASE 2  |  Ensemble CI Race (PSO + MOPSO-LF + Firefly)", t0)
+    _log("PHASE 2  |  Ensemble CI Race (" + " + ".join(a.upper() for a in algorithms) + ")", t0)
     _log("=" * 60, t0)
     _log(
         f"  algorithms={algorithms}  swarm_size={swarm_size}  iterations={iterations}  "
@@ -641,26 +662,55 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as exc:
             _log(f"  CI RANS FAILED: {exc}", t0)
 
-        # 3c) Additional top candidates from each algorithm
+        # 3c) Pareto-informed RANS candidates
+        #     Priority: Pareto knee > best-by-loss > top-by-thrust
         rans_top_k = int(opt_cfg.get("rans_top_k", 5))
-        # Gather top candidates across all algorithms
+
+        # Build full scored list
         all_scored = []
         for ar in ensemble.algo_results:
             for i, (r, p) in enumerate(zip(ar.history, ar.history_params)):
                 all_scored.append((float(r.thrust), r, p, ar.algorithm, i))
-        all_scored.sort(key=lambda x: x[0], reverse=True)
 
-        extra_candidates = []
+        extra_candidates: List[Tuple[Any, ...]] = []
         seen_params = {str(best_params)}
+
+        def _try_add(result, params, algo_name, idx_in_algo, tag=""):
+            key = str(params)
+            if key not in seen_params and len(extra_candidates) < max(0, rans_top_k - 1):
+                extra_candidates.append((result, params, algo_name, idx_in_algo, tag))
+                seen_params.add(key)
+
+        # (i) Pareto knee from multi-objective analysis
+        knee_info = mo_summary.get("best_pareto_knee", {}) if mo_summary else {}
+        if knee_info and knee_info.get("params"):
+            knee_idx = int(knee_info.get("candidate_index", -1))
+            if 0 <= knee_idx < len(ensemble._history):
+                _try_add(
+                    ensemble._history[knee_idx],
+                    ensemble._history_params[knee_idx],
+                    "pareto_knee", knee_idx, "knee",
+                )
+
+        # (ii) Best by pressure loss
+        loss_sorted = sorted(all_scored, key=lambda x: float(x[1].pressureLoss))
+        if loss_sorted:
+            _, r_bl, p_bl, a_bl, i_bl = loss_sorted[0]
+            _try_add(r_bl, p_bl, a_bl, i_bl, "best_loss")
+
+        # (iii) Remaining slots filled by top thrust
+        all_scored.sort(key=lambda x: x[0], reverse=True)
         for _, r, p, algo, idx in all_scored:
-            if str(p) not in seen_params and len(extra_candidates) < max(0, rans_top_k - 1):
-                extra_candidates.append((r, p, algo, idx))
-                seen_params.add(str(p))
+            _try_add(r, p, algo, idx, "top_thrust")
 
         if extra_candidates:
-            _log(f"  3c) RANS on {len(extra_candidates)} additional top candidates ...", t0)
-            for r, p, algo, idx in extra_candidates:
+            _log(f"  3c) RANS on {len(extra_candidates)} Pareto-informed candidates ...", t0)
+            for entry in extra_candidates:
+                r, p, algo, idx = entry[0], entry[1], entry[2], entry[3]
+                tag = entry[4] if len(entry) > 4 else ""
                 gid = f"rans_{algo}_{idx:04d}"
+                if tag:
+                    gid = f"rans_{tag}_{algo}_{idx:04d}"
                 geom = build_geometry_from_params(p, throat, n_pts, mach_e, gamma, gid)
                 _log(f"    RANS {gid} ...", t0)
                 try:
@@ -877,16 +927,18 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
 
     # ---- Analysis report ----
     note = AnalysisNote(
-        title="Nozzle Design Benchmark — Ensemble CI (PSO + MOPSO-LF + Firefly)",
+        title="Nozzle Design Benchmark — Ensemble CI (PSO + MOPSO-LF + Firefly + ABC)",
         notes=(
             "5-phase ensemble pipeline: (1) MOC baseline via Prandtl-Meyer isentropic "
             "characteristic mesh, (2) Multi-algorithm CI race — PSO, MOPSO with Lévy "
-            "Flights, and Firefly Algorithm — all searching a 5D design space "
-            "(exit_radius, length, straighten_frac, ramp_power, throat_angle_deg), "
-            "(3) RANS validation using OpenFOAM shockFluid, (4) multi-fidelity comparison "
-            "table, (5) ensemble comparative plots including algorithm race, Pareto overlay, "
-            "diversity comparison, search-space heatmaps, box plots, and radar chart.  "
-            "The pipeline picks the overall winner across all algorithms."
+            "Flights, Firefly Algorithm, and Artificial Bee Colony — all searching a 5D "
+            "design space (exit_radius, length, straighten_frac, ramp_power, "
+            "throat_angle_deg) with 3-objective Pareto (thrust, pressure loss, length), "
+            "(3) RANS validation of CI-best, Pareto knee, best-by-loss, and top-K via "
+            "OpenFOAM shockFluid, (4) multi-fidelity comparison table, (5) ensemble "
+            "comparative plots including algorithm race, Pareto overlay, diversity "
+            "comparison, search-space heatmaps, box plots, and radar chart.  "
+            "The pipeline picks the overall winner via 3-objective Pareto dominance."
         ),
     )
     for k, v in comparison.items():
@@ -957,7 +1009,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Ensemble CI nozzle design: MOC -> PSO+MOPSO+Firefly -> RANS -> Compare"
+        description="Ensemble CI nozzle design: MOC -> PSO+MOPSO+Firefly+ABC -> RANS -> Compare"
     )
     parser.add_argument(
         "--config", type=str, default="",
