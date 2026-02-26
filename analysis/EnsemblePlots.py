@@ -1,14 +1,15 @@
 """Comparative visualisations for the multi-algorithm CI ensemble.
 
-Produces publication-quality figures that compare PSO, MOPSO-LF, and
-Firefly results side-by-side:
+Produces publication-quality figures that compare PSO, MOPSO-LF,
+Firefly, and ABC results side-by-side:
 
-  1. Algorithm Race — global-best convergence overlay
+  1. Algorithm Race — best thrust convergence overlay (per iteration)
   2. Pareto Front Overlay — thrust vs pressure loss, colour by algorithm
   3. Diversity Comparison — swarm spread over iterations
   4. Search-space Exploration Heatmap — algorithm footprint
   5. Box plots — thrust/loss distributions per algorithm
   6. Radar chart — multi-metric algorithm fingerprint
+  7. Summary table — comparison image
 """
 
 from __future__ import annotations
@@ -27,11 +28,13 @@ ALGO_COLOURS = {
     "pso": "#1f77b4",
     "mopso_lf": "#d62728",
     "firefly": "#2ca02c",
+    "abc": "#ff7f0e",
 }
 ALGO_LABELS = {
     "pso": "PSO",
     "mopso_lf": "MOPSO-LF",
     "firefly": "Firefly",
+    "abc": "ABC",
 }
 
 
@@ -54,20 +57,42 @@ def plot_algorithm_race(
     moc_thrust: Optional[float] = None,
     dpi: int = 200,
 ) -> None:
-    """Global-best convergence curves, one line per algorithm."""
+    """Best-thrust convergence curves, one line per algorithm.
+
+    Instead of using the internal ``gbest_trace`` (which stores
+    algorithm-specific composite scores that are *not* comparable
+    across PSO / MOPSO / Firefly / ABC), this reconstructs the
+    best-so-far thrust per iteration from the evaluation history.
+    """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(10, 5))
 
     for ar in algo_results:
-        trace = ar.gbest_trace
-        if not trace:
+        if not ar.history:
             continue
-        iters = list(range(len(trace)))
+        # Determine swarm_size from the traces or fall back to heuristics
+        n_iters = len(ar.gbest_trace) if ar.gbest_trace else 1
+        n_evals = len(ar.history)
+        swarm_size = max(1, round(n_evals / max(n_iters, 1)))
+
+        # Build best-so-far thrust per iteration
+        best_thrust: list[float] = []
+        running_best = -1e30
+        for it in range(n_iters):
+            start = it * swarm_size
+            end = min(start + swarm_size, n_evals)
+            for j in range(start, end):
+                t_j = float(ar.history[j].thrust)
+                if t_j > running_best:
+                    running_best = t_j
+            best_thrust.append(running_best)
+
+        iters = list(range(len(best_thrust)))
         colour = _algo_colour(ar.algorithm)
         label = _algo_label(ar.algorithm)
-        ax.plot(iters, trace, "o-", color=colour, linewidth=2.0,
+        ax.plot(iters, best_thrust, "o-", color=colour, linewidth=2.0,
                 markersize=4, label=label, alpha=0.85)
 
     if moc_thrust is not None:
@@ -75,7 +100,7 @@ def plot_algorithm_race(
                     label="MOC baseline", alpha=0.6)
 
     ax.set_xlabel("Iteration", fontsize=11)
-    ax.set_ylabel("Global Best Score", fontsize=11)
+    ax.set_ylabel("Best Thrust [N]", fontsize=11)
     ax.set_title("Algorithm Race — Convergence Comparison", fontsize=13, fontweight="bold")
     ax.grid(True, alpha=0.25)
     ax.legend(fontsize=9)
@@ -346,17 +371,30 @@ def plot_algorithm_radar(
         div = ar.diversity_trace[-1] if ar.diversity_trace else 0.0
         exploration = min(div * 5, 1.0)  # scale to ~[0,1]
 
-        # Convergence speed = how early gbest stabilised
-        trace = ar.gbest_trace
-        if len(trace) > 2:
-            final = trace[-1]
-            half_final = (trace[0] + final) / 2.0
+        # Convergence speed = how quickly best thrust approached its final value
+        #   Use thrust from history (comparable) not internal score
+        if ar.history and len(ar.history) > 2:
+            n_it = len(ar.gbest_trace) if ar.gbest_trace else 1
+            n_ev = len(ar.history)
+            sw = max(1, round(n_ev / max(n_it, 1)))
+            thrust_curve = []
+            rbest = -1e30
+            for it in range(n_it):
+                s = it * sw
+                e = min(s + sw, n_ev)
+                for j in range(s, e):
+                    tj = float(ar.history[j].thrust)
+                    if tj > rbest:
+                        rbest = tj
+                thrust_curve.append(rbest)
+            final = thrust_curve[-1]
+            half_target = (thrust_curve[0] + final) / 2.0
             speed_idx = 0
-            for i, v in enumerate(trace):
-                if v >= half_final:
+            for i, v in enumerate(thrust_curve):
+                if v >= half_target:
                     speed_idx = i
                     break
-            conv_speed = 1.0 - speed_idx / max(len(trace) - 1, 1)
+            conv_speed = 1.0 - speed_idx / max(len(thrust_curve) - 1, 1)
         else:
             conv_speed = 0.5
 
